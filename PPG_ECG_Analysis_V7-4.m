@@ -1,5 +1,5 @@
 %/**
-%@author Diana Carolina Martínez Reyes (dmare)
+%@author Diana Carolina Martï¿½nez Reyes (dmare)
 %This algorithm reads the values corresponding to systolic and diastolic
 %blood pressure from the patient dataset. As well it reads the
 %electrocardiogram (ECG) and photoplethysmogram (PPG) signal values. Then it procedess to
