@@ -1,0 +1,155 @@
+# Blood Pressure Prediction Model Configuration
+models:
+  random_forest:
+    enabled: true
+    param_grid:
+      n_estimators: [200, 300, 500, 800]
+      max_depth: [15, 20, 25, null]
+      min_samples_split: [2, 5, 10]
+      min_samples_leaf: [1, 2, 4]
+      max_features: ['sqrt', 'log2', 0.3, 0.5, 0.7]
+      bootstrap: [true, false]
+  
+  extra_trees:
+    enabled: true
+    param_grid:
+      n_estimators: [200, 300, 500]
+      max_depth: [15, 20, 25, null]
+      min_samples_split: [2, 5, 10]
+      min_samples_leaf: [1, 2, 4]
+      max_features: ['sqrt', 'log2', 0.3, 0.5]
+      bootstrap: [true, false]
+      
+  xgboost_fixed:
+    enabled: true
+    base_params:
+      objective: 'reg:squarederror'
+      eval_metric: 'rmse'
+      random_state: 42
+      early_stopping_rounds: 10
+      tree_method: 'hist'
+      verbosity: 0
+    param_grid:
+      n_estimators: [300, 500, 800]
+      learning_rate: [0.01, 0.05, 0.1]
+      max_depth: [4, 6, 8]
+      subsample: [0.8, 0.9, 1.0]
+      colsample_bytree: [0.8, 0.9, 1.0]
+      reg_alpha: [0.1, 0.5, 1.0]     # Enhanced L1 regularization
+      reg_lambda: [1.0, 2.0, 3.0]    # Enhanced L2 regularization
+      min_child_weight: [1, 3, 5]    # Prevent overfitting
+      gamma: [0, 0.1, 0.2]           # Minimum loss reduction
+  
+  gradient_boosting:
+    enabled: true
+    param_grid:
+      n_estimators: [200, 300, 400]
+      learning_rate: [0.01, 0.05, 0.1]
+      max_depth: [4, 6, 8]
+      min_samples_split: [2, 5, 10]
+      min_samples_leaf: [1, 2, 4]
+      subsample: [0.8, 0.9, 1.0]
+      max_features: ['sqrt', 'log2']
+  
+  lightgbm:
+    enabled: true
+    param_grid:
+      n_estimators: [300, 500]
+      learning_rate: [0.01, 0.05, 0.1]
+      max_depth: [6, 8, 10]
+      num_leaves: [31, 50, 70]
+      subsample: [0.8, 0.9]
+      feature_fraction: [0.8, 0.9]
+      reg_alpha: [0, 0.1]
+      reg_lambda: [1, 1.5]
+  
+  support_vector:
+    enabled: true
+    param_grid:
+      kernel: ['rbf', 'linear']
+      C: [0.1, 1, 10, 100]
+      gamma: ['scale', 'auto', 0.001, 0.01, 0.1]
+      epsilon: [0.01, 0.1, 1]
+  
+  neural_network:
+    enabled: true
+    param_grid:
+      hidden_layer_sizes: [(100,), (200,), (100, 50), (200, 100), (300, 150, 75)]
+      learning_rate_init: [0.001, 0.01, 0.1]
+      alpha: [0.0001, 0.001, 0.01]
+      max_iter: [1000]
+      early_stopping: [true]
+      validation_fraction: [0.1]
+
+ensemble:
+  enabled: true
+  stacking_meta_model: 'ridge'
+  voting_weights: 'performance_based'
+  blend_ratio: 0.3
+
+evaluation:
+  cv_folds: 5
+  test_size: 0.2
+  random_state: 42
+  metrics: ['rmse', 'mae', 'r2', 'clinical_accuracy']
+  
+  # Cross-validation strategies
+  cv_strategies:
+    - 'GroupKFold'  # Patient-level splitting
+    - 'StratifiedGroupKFold'  # Stratified by BP ranges
+
+# Clinical validation thresholds (mmHg)
+clinical_thresholds:
+  excellent_error: 5
+  good_error: 10
+  acceptable_error: 15
+  
+  # Medical standards
+  british_hypertension_society:
+    grade_a: 5   # ≤5 mmHg: 60% of readings
+    grade_b: 10  # ≤10 mmHg: 85% of readings
+    grade_c: 15  # ≤15 mmHg: 95% of readings
+  
+  aami_standard:
+    mean_error_limit: 5
+    std_error_limit: 8
+
+# Feature engineering
+feature_engineering:
+  signal_processing:
+    sampling_rate: 125
+    filter_type: 'butterworth'
+    lowpass_cutoff: 10
+    highpass_cutoff: 0.5
+    
+  morphological_features:
+    enabled: true
+    window_size: 50
+    
+  wavelet_features:
+    enabled: true
+    wavelet_type: 'db4'
+    levels: 4
+    
+  hrv_features:
+    enabled: true
+    
+  cross_correlation:
+    enabled: true
+    max_lag: 50
+
+# Model selection and training
+training:
+  feature_selection:
+    method: 'SelectFromModel'
+    threshold: 'median'
+    estimator: 'XGBRegressor'
+  
+  scaling:
+    method: 'StandardScaler'
+  
+  hyperparameter_optimization:
+    method: 'GridSearchCV'
+    cv_folds: 5
+    scoring: 'neg_mean_squared_error'
+    n_jobs: -1
