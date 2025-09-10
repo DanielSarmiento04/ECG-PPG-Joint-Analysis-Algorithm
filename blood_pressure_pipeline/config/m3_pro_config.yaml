@@ -1,0 +1,192 @@
+# M3 Pro Optimized Configuration
+# Leverages Apple Silicon capabilities for maximum performance
+
+# Hardware configuration for MacBook Pro M3 Pro
+hardware:
+  platform: "apple_silicon_m3_pro"
+  cpu_cores: 12  # M3 Pro has 12 CPU cores (6 performance + 6 efficiency)
+  gpu_cores: 18  # M3 Pro has 18 GPU cores
+  memory_gb: 18  # Adjust based on your configuration (18GB or 36GB)
+  use_metal_acceleration: true
+  use_accelerate_framework: true
+
+# Performance optimizations
+performance:
+  # Parallel processing optimized for M3 Pro
+  n_jobs: 10  # Leave 2 cores for system processes
+  parallel_backend: "threading"  # Better for I/O bound tasks on M3
+  batch_size: 512  # Optimized for M3 Pro memory bandwidth
+  
+  # Memory management
+  memory_efficient: true
+  chunk_size: 1000  # Process data in chunks to optimize memory usage
+  cache_preprocessed: true
+  
+  # XGBoost optimizations for Apple Silicon
+  xgb_tree_method: "hist"  # Fastest on M3 Pro
+  xgb_device: "cpu"  # CPU optimized for M3 Pro cores
+  
+  # Random Forest optimizations
+  rf_n_jobs: 10
+  rf_max_samples: 0.8  # Use 80% of data for each tree (memory optimization)
+
+# Models configuration optimized for M3 Pro
+models:
+  random_forest:
+    enabled: true
+    param_grid:
+      n_estimators: [300, 500, 800]  # Increased for M3 Pro power
+      max_features: ['sqrt', 'log2', 0.3, 0.5]
+      max_depth: [10, 15, 20, None]
+      min_samples_split: [2, 5, 10]
+      min_samples_leaf: [1, 2, 4]
+    base_params:
+      n_jobs: 10
+      random_state: 42
+      warm_start: true  # Memory efficient incremental learning
+      max_samples: 0.8  # Bootstrap sample size optimization
+  
+  xgboost_m3_optimized:
+    enabled: true
+    param_grid:
+      learning_rate: [0.01, 0.05, 0.1, 0.15]
+      max_depth: [3, 4, 5, 6]
+      n_estimators: [200, 300, 500]
+      subsample: [0.8, 0.9, 1.0]
+      colsample_bytree: [0.8, 0.9, 1.0]
+      reg_alpha: [0.1, 0.5, 1.0]
+      reg_lambda: [1.0, 2.0, 3.0]
+    base_params:
+      objective: 'reg:squarederror'
+      eval_metric: 'rmse'
+      tree_method: 'hist'  # Optimized for M3 Pro
+      nthread: 10  # Use M3 Pro cores efficiently
+      early_stopping_rounds: 15
+      random_state: 42
+      verbosity: 0
+  
+  lightgbm:
+    enabled: true  # LightGBM works excellently on M3 Pro
+    param_grid:
+      learning_rate: [0.01, 0.05, 0.1]
+      num_leaves: [31, 50, 70, 100]
+      n_estimators: [200, 300, 500]
+      subsample: [0.8, 0.9, 1.0]
+      colsample_bytree: [0.8, 0.9, 1.0]
+      reg_alpha: [0.1, 0.5, 1.0]
+      reg_lambda: [1.0, 2.0, 3.0]
+    base_params:
+      objective: 'regression'
+      metric: 'rmse'
+      num_threads: 10
+      force_row_wise: true  # Better for M3 Pro memory architecture
+      early_stopping_rounds: 15
+      random_state: 42
+      verbosity: -1
+  
+  # Neural network with Metal Performance Shaders (if using PyTorch)
+  neural_network:
+    enabled: false  # Enable if you want to use neural networks
+    device: "mps"  # Metal Performance Shaders for M3 Pro GPU
+    batch_size: 256
+    epochs: 100
+    learning_rate: 0.001
+
+# Cross-validation optimized for M3 Pro
+cross_validation:
+  n_splits: 5
+  shuffle: true
+  random_state: 42
+  n_jobs: 5  # Parallel CV folds
+
+# Feature engineering optimizations
+feature_engineering:
+  enhanced_extraction: true
+  wavelet_features: true
+  cross_correlation: true
+  frequency_features: true
+  
+  # Signal processing optimizations
+  signal_processing:
+    use_scipy_optimizations: true
+    fft_backend: "scipy"  # Optimized for Apple Silicon
+    parallel_feature_extraction: true
+    feature_selection: true
+    max_features: 100  # Limit features for memory efficiency
+
+# Data loading and preprocessing
+data_processing:
+  # Use polars for large datasets (faster than pandas on M3)
+  use_polars: false  # Set to true if you install polars
+  chunk_processing: true
+  chunk_size: 5000
+  
+  # Memory optimizations
+  optimize_dtypes: true  # Use optimal data types
+  sparse_matrices: false  # Dense matrices are better on M3 Pro
+  
+  # Caching
+  cache_features: true
+  cache_directory: "./cache"
+
+# Evaluation settings
+evaluation:
+  clinical_validation: true
+  generate_plots: true
+  plot_dpi: 150  # Optimized for Retina displays
+  save_predictions: true
+  detailed_analysis: true
+  
+  # Parallel evaluation
+  parallel_evaluation: true
+  cv_folds: 5
+
+# Logging optimized for development
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  console_output: true
+  file_output: true
+  log_performance_metrics: true
+  profile_execution: true  # Enable profiling for optimization
+
+# Output settings
+output:
+  save_models: true
+  model_format: "joblib"  # Efficient on M3 Pro
+  save_feature_importance: true
+  save_predictions: true
+  generate_report: true
+  
+  # Visualization settings for Retina displays
+  plot_settings:
+    dpi: 300
+    format: "png"
+    style: "seaborn-v0_8"
+    figsize: [12, 8]
+
+# Development and debugging
+development:
+  debug_mode: false
+  profile_memory: false
+  profile_time: false
+  verbose_output: true
+  
+  # Testing settings
+  test_size: 0.2
+  validation_size: 0.1
+  stratify: true
+
+# Apple Silicon specific optimizations
+apple_silicon:
+  # Use Apple's Accelerate framework for BLAS operations
+  use_accelerate: true
+  
+  # Memory management for unified memory architecture
+  memory_pressure_handling: true
+  
+  # Thermal management (M3 Pro runs cool, but still good practice)
+  thermal_aware: true
+  
+  # Power efficiency settings
+  efficiency_cores_ratio: 0.3  # Use efficiency cores for I/O operations

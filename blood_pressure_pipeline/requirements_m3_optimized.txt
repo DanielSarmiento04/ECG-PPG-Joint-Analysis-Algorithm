@@ -1,0 +1,68 @@
+# MacBook Pro M3 Pro Optimized Requirements
+# Optimized for Apple Silicon (ARM64) architecture
+
+# Core dependencies with Apple Silicon optimizations
+numpy>=1.24.0  # Better ARM64 support and performance
+pandas>=2.0.0  # Significant performance improvements on ARM64
+scikit-learn>=1.3.0  # ARM64 optimizations and better threading
+
+# Scientific computing optimized for M3
+scipy>=1.11.0  # ARM64 optimizations and BLAS improvements
+
+# Machine learning models with ARM64 optimizations
+xgboost>=2.0.0  # Native ARM64 support and M-series optimizations
+lightgbm>=4.0.0  # Apple Silicon native compilation
+
+# Visualization with Metal acceleration support
+matplotlib>=3.7.0  # Better performance on macOS
+seaborn>=0.12.0  # Updated for better pandas 2.x compatibility
+
+# Signal processing optimized for ARM64
+PyWavelets>=1.4.0  # ARM64 performance improvements
+
+# Configuration and serialization
+PyYAML>=6.0.0
+joblib>=1.3.0  # Parallel processing optimizations for M-series
+
+# Data file handling
+openpyxl>=3.1.0  # Performance improvements
+
+# M3 Pro specific optimizations
+# These packages leverage Apple's Accelerate framework
+# accelerate-framework>=0.21.0  # Apple's optimized BLAS/LAPACK
+tensorflow-macos>=2.13.0  # Apple Silicon optimized TensorFlow (optional)
+tensorflow-metal>=1.0.0  # Metal GPU acceleration (optional)
+
+# Memory optimization for large datasets
+polars>=0.19.0  # Ultra-fast DataFrame library, alternative to pandas for large data
+pyarrow>=13.0.0  # Fast columnar data processing
+
+# Parallel processing optimizations
+multiprocessing-logging>=0.3.4  # Better logging for parallel processes
+concurrent-futures>=3.1.0  # Enhanced parallel execution
+
+# Optional: Neural network acceleration
+torch>=2.1.0  # PyTorch with Metal Performance Shaders (MPS) support
+torchvision>=0.16.0  # Computer vision with MPS support
+
+# Development and monitoring tools optimized for M3
+psutil>=5.9.0  # System monitoring and resource usage
+memory-profiler>=0.61.0  # Memory usage profiling
+line-profiler>=4.0.0  # Code profiling for optimization
+
+# Production deployment tools
+uvicorn[standard]>=0.23.0  # High-performance ASGI server
+fastapi>=0.104.0  # Modern API framework
+gunicorn>=21.0.0  # WSGI server with ARM64 optimizations
+
+# Optional: Experiment tracking and MLOps
+mlflow>=2.7.0  # Experiment tracking with ARM64 support
+wandb>=0.15.0  # Weights & Biases for experiment tracking
+
+# Development tools (uncomment for development)
+# pytest>=7.4.0
+# pytest-cov>=4.1.0
+# black>=23.0.0
+# flake8>=6.0.0
+# isort>=5.12.0
+# pre-commit>=3.4.0
