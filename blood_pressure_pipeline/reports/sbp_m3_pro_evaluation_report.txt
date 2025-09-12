@@ -1,0 +1,35 @@
+
+SBP Model Evaluation Report
+=========================================
+
+Best Model: xgboost_m3_optimized
+Performance Metrics:
+- R² Score: 0.8458
+- RMSE: 6.33 mmHg
+- MAE: 4.54 mmHg
+- Mean Error: 4.54 mmHg
+- Std Error: 4.42 mmHg
+
+Clinical Validation:
+- Within ±5 mmHg: 67.6%
+- Within ±10 mmHg: 89.3%
+- Within ±15 mmHg: 96.5%
+- BHS Grade: A
+- AAMI Standard: PASS
+
+Training Time: 3371.7 seconds
+Validation Samples: 3971
+
+All Models Performance:
+
+xgboost_m3_optimized:
+  R²: 0.8458, RMSE: 6.33, BHS: A, AAMI: PASS
+random_forest_m3:
+  R²: 0.8064, RMSE: 7.10, BHS: B, AAMI: FAIL
+
+=== M3 PRO OPTIMIZATION REPORT ===
+Hardware: M3 Pro (or similar)
+CPU Cores: 11
+Memory: 18.0 GB
+Parallel Jobs: 10
+Apple Silicon Optimizations: Enabled

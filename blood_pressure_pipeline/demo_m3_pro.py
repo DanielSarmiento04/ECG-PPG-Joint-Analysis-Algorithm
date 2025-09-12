@@ -36,7 +36,7 @@ def main():
         logger.info("Importing M3 Pro optimized modules...")
         
         from pipelines.main_pipeline import BloodPressurePipeline
-        from models.model_trainer_m3_pro import AppleSiliconOptimizer
+        from models.model_trainer_m3_pro_clean import AppleSiliconOptimizer
         from utils.logging_config import setup_logging
         
         # Detect hardware and optimize
@@ -87,7 +87,7 @@ def main():
             'models': {
                 'random_forest': {'enabled': True},
                 'xgboost_m3_optimized': {'enabled': True},
-                'lightgbm_m3': {'enabled': True}
+                'lightgbm': {'enabled': False}  # Disabled due to compatibility issues
             },
             'ensemble': {'enabled': True},
             'evaluation': {'clinical_validation': True}
@@ -160,8 +160,8 @@ def run_m3_pro_optimized_pipeline(data_file: str, config: dict, hardware_info: d
     
     from data.data_validator import validate_and_clean_data
     from data.feature_extractor import extract_enhanced_features
-    from models.model_trainer_m3_pro import train_enhanced_models_m3_pro
-    from models.model_evaluator import evaluate_models
+    from models.model_trainer_m3_pro_clean import train_enhanced_models_m3_pro
+    from models.model_evaluator_simple import evaluate_models
     import pandas as pd
     
     print("\n1️⃣  Loading and validating data...")

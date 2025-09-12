@@ -41,18 +41,29 @@ except ImportError:
     yaml = None
     YAML_AVAILABLE = False
 
-# Optional: Neural network with Metal Performance Shaders
+# Optional imports with fallbacks
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    lgb = None
+    LIGHTGBM_AVAILABLE = False
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    yaml = None
+    YAML_AVAILABLE = False
+
 try:
     import torch
     import torch.nn as nn
-    PYTORCH_AVAILABLE = True
-    # Check for Metal Performance Shaders support
-    METAL_AVAILABLE = torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False
+    TORCH_AVAILABLE = True
 except ImportError:
     torch = None
     nn = None
-    PYTORCH_AVAILABLE = False
-    METAL_AVAILABLE = False
+    TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +101,11 @@ class AppleSiliconOptimizer:
         """Optimize NumPy for Apple Silicon."""
         if platform.machine() == 'arm64':
             # Use Apple's Accelerate framework
-            os.environ['OPENBLAS_NUM_THREADS'] = str(min(8, os.cpu_count()))
-            os.environ['MKL_NUM_THREADS'] = str(min(8, os.cpu_count()))
-            os.environ['VECLIB_MAXIMUM_THREADS'] = str(min(8, os.cpu_count()))
+            # Set thread limits for M3 Pro optimization
+            cpu_count = os.cpu_count() or 8  # Fallback to 8 if None
+            os.environ['OPENBLAS_NUM_THREADS'] = str(min(8, cpu_count))
+            os.environ['MKL_NUM_THREADS'] = str(min(8, cpu_count))
+            os.environ['VECLIB_MAXIMUM_THREADS'] = str(min(8, cpu_count))
             logger.info("NumPy optimized for Apple Silicon with Accelerate framework")
 
 class M3ProModelTrainer:
@@ -119,10 +132,13 @@ class M3ProModelTrainer:
         if config_path and Path(config_path).exists() and YAML_AVAILABLE:
             try:
                 with open(config_path, 'r') as f:
-                    file_config = yaml.safe_load(f)
-                    # Merge with defaults
-                    default_config.update(file_config)
-                    logger.info(f"Configuration loaded from {config_path}")
+                    if yaml is not None:
+                        file_config = yaml.safe_load(f)
+                        # Merge with defaults
+                        default_config.update(file_config)
+                        logger.info(f"Configuration loaded from {config_path}")
+                    else:
+                        logger.warning("YAML not available, using default configuration")
             except Exception as e:
                 logger.warning(f"Could not load config from {config_path}: {e}")
                 
@@ -238,7 +254,7 @@ class M3ProModelTrainer:
             logger.warning("LightGBM not available, skipping")
             return {}
         
-        config = self.config['models']['lightgbm_m3']
+        config = self.config['models']['lightgbm']
         if not config['enabled']:
             return {}
         
@@ -397,8 +413,8 @@ class M3ProModelTrainer:
                 if xgb_result:
                     target_results['xgboost_m3_optimized'] = xgb_result
             
-            # LightGBM with M3 Pro optimizations
-            if self.config['models']['lightgbm_m3']['enabled']:
+            # LightGBM with M3 Pro optimizations (disabled for now due to compatibility issues)
+            if self.config['models']['lightgbm']['enabled']:
                 lgb_result = self.train_lightgbm_m3_optimized(X_train, y_train, X_val, y_val)
                 if lgb_result:
                     target_results['lightgbm_m3'] = lgb_result
@@ -479,7 +495,7 @@ class M3ProModelTrainer:
         # Create XGBoost regressor
         xgb_model = xgb.XGBRegressor(**base_params)
         
-        # Grid search with M3 Pro optimizations
+        # Grid search with M3 Pro optimizations (without eval_set for GridSearchCV compatibility)
         cv_folds = GroupKFold(n_splits=3)
         grid_search = GridSearchCV(
             xgb_model, config['param_grid'],
@@ -491,16 +507,11 @@ class M3ProModelTrainer:
         
         # Create dummy groups
         groups = np.arange(len(X_train)) % 3
-        grid_search.fit(
-            X_train, y_train,
-            groups=groups,
-            eval_set=[(X_val, y_val)],
-            verbose=False
-        )
+        grid_search.fit(X_train, y_train, groups=groups)
         
         best_model = grid_search.best_estimator_
         
-        # Predictions
+        # Make final predictions with the best model
         y_pred_train = best_model.predict(X_train)
         y_pred_val = best_model.predict(X_val)
         

@@ -61,12 +61,11 @@ models:
       eval_metric: 'rmse'
       tree_method: 'hist'  # Optimized for M3 Pro
       nthread: 10  # Use M3 Pro cores efficiently
-      early_stopping_rounds: 15
       random_state: 42
       verbosity: 0
   
   lightgbm:
-    enabled: true  # LightGBM works excellently on M3 Pro
+    enabled: true 
     param_grid:
       learning_rate: [0.01, 0.05, 0.1]
       num_leaves: [31, 50, 70, 100]
@@ -80,7 +79,6 @@ models:
       metric: 'rmse'
       num_threads: 10
       force_row_wise: true  # Better for M3 Pro memory architecture
-      early_stopping_rounds: 15
       random_state: 42
       verbosity: -1
   
