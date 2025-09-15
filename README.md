@@ -364,7 +364,7 @@ print(f"AAMI Pass: {clinical_results['aami_pass']}")
 - **CE marking**: European medical device certification
 - **Clinical trials**: Validation in diverse patient populations
 - **Quality standards**: ISO 13485 medical device quality management
-
+<!-- 
 ## Limitations & Future Work
 
 ### Known Limitations
@@ -404,7 +404,7 @@ print(f"AAMI Pass: {clinical_results['aami_pass']}")
 2. **Real-time processing**: Sub-100ms prediction latency
 3. **Cloud integration**: Secure data processing and storage
 4. **API development**: Healthcare system integration
-5. **Regulatory submission**: FDA and CE marking applications
+5. **Regulatory submission**: FDA and CE marking applications -->
 
 <!-- ## Citation -->
 
@@ -441,8 +441,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Medical device development**: Regulatory compliance required
 - **Open source contributions**: Welcome under MIT license terms -->
 
-## Contact
 <!-- 
+## Contact
 ### Author and Maintainer Information
 
 **Principal Investigator:**
@@ -473,4 +473,8 @@ Special thanks to:
 
 ---
 
+<!-- 
+
 **Note**: This software is for research purposes only and has not been approved for clinical use. Always consult with healthcare professionals for medical decisions.
+
+-->

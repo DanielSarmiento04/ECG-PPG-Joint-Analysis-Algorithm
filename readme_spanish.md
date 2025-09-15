@@ -364,7 +364,7 @@ print(f"AAMI Aprobado: {clinical_results['aami_pass']}")
 - **Marcado CE**: Certificación de dispositivo médico europeo
 - **Ensayos clínicos**: Validación en poblaciones diversas de pacientes
 - **Estándares de calidad**: Gestión de calidad de dispositivos médicos ISO 13485
-
+<!-- 
 ## Limitaciones y Trabajo Futuro
 
 ### Limitaciones Conocidas
@@ -404,7 +404,7 @@ print(f"AAMI Aprobado: {clinical_results['aami_pass']}")
 2. **Procesamiento en tiempo real**: Latencia de predicción sub-100ms
 3. **Integración en la nube**: Procesamiento y almacenamiento seguro de datos
 4. **Desarrollo de API**: Integración de sistemas de atención sanitaria
-5. **Presentación regulatoria**: Aplicaciones de marcado FDA y CE
+5. **Presentación regulatoria**: Aplicaciones de marcado FDA y CE -->
 <!-- 
 ## Citas
 
