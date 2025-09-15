@@ -405,7 +405,7 @@ print(f"AAMI Aprobado: {clinical_results['aami_pass']}")
 3. **Integración en la nube**: Procesamiento y almacenamiento seguro de datos
 4. **Desarrollo de API**: Integración de sistemas de atención sanitaria
 5. **Presentación regulatoria**: Aplicaciones de marcado FDA y CE
-
+<!-- 
 ## Citas
 
 ### Cómo Citar Este Trabajo
@@ -473,4 +473,4 @@ Agradecimientos especiales a:
 
 ---
 
-**Nota**: Este software es solo para propósitos de investigación y no ha sido aprobado para uso clínico. Siempre consulte con profesionales de la salud para decisiones médicas.
+**Nota**: Este software es solo para propósitos de investigación y no ha sido aprobado para uso clínico. Siempre consulte con profesionales de la salud para decisiones médicas. -->

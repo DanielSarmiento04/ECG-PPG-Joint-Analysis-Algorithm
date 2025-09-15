@@ -406,9 +406,9 @@ print(f"AAMI Pass: {clinical_results['aami_pass']}")
 4. **API development**: Healthcare system integration
 5. **Regulatory submission**: FDA and CE marking applications
 
-## Citation
+<!-- ## Citation -->
 
-### How to Cite This Work
+<!-- ### How to Cite This Work
 
 ```bibtex
 @article{sarmiento2024_bp_prediction,
@@ -421,7 +421,7 @@ print(f"AAMI Pass: {clinical_results['aami_pass']}")
     doi={10.1016/j.bspc.2024.XXXXX},
     url={https://github.com/DanielSarmiento04/ECG-PPG-Joint-Analysis-Algorithm}
 }
-```
+``` -->
 
 ### Academic References
 
@@ -430,7 +430,7 @@ Key scientific foundations:
 - ECG-PPG signal processing (Allen, 2007)
 - Machine learning in biomedical signals (Rajkomar et al., 2018)
 - Clinical validation standards (O'Brien et al., 2010)
-
+<!-- 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
@@ -439,10 +439,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Academic research**: Free use for non-commercial research
 - **Commercial applications**: Contact authors for licensing agreements
 - **Medical device development**: Regulatory compliance required
-- **Open source contributions**: Welcome under MIT license terms
+- **Open source contributions**: Welcome under MIT license terms -->
 
 ## Contact
-
+<!-- 
 ### Author and Maintainer Information
 
 **Principal Investigator:**
@@ -454,22 +454,22 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 **Research Group:**
 - **Laboratory**: Biomedical Signal Processing Lab
 - **Department**: Biomedical Engineering
-- **Website**: [lab-website.university.edu]
-
+- **Website**: [lab-website.university.edu] -->
+<!-- 
 ### Support and Contributions
 
 - **Issues**: Report bugs and feature requests on GitHub
 - **Contributions**: Pull requests welcome following contribution guidelines
 - **Documentation**: Help improve documentation and examples
-- **Clinical validation**: Collaborate on clinical studies and validation
+- **Clinical validation**: Collaborate on clinical studies and validation -->
 
-### Acknowledgments
+<!-- ### Acknowledgments
 
 Special thanks to:
 - Clinical collaborators for data collection and validation
 - Research funding agencies and institutional support
 - Open-source community for foundational tools and libraries
-- Apple Silicon optimization community for hardware insights
+- Apple Silicon optimization community for hardware insights -->
 
 ---
 
