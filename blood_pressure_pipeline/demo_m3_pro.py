@@ -264,12 +264,11 @@ def display_m3_pro_results(results, hardware_info, execution_time):
         comparison_df = sbp_evaluation['_summary']['comparison_table']
         if not comparison_df.empty:
             best_model = comparison_df.iloc[0]
-            
-            print(f"\n🏥 Clinical Validation (Best Model: {best_model['Model']}):")
-            print(f"   • BHS Grade: {best_model['BHS Grade']}")
-            print(f"   • Within ±5 mmHg: {best_model['Within ±5 mmHg (%)']:.1f}%")
-            print(f"   • Within ±10 mmHg: {best_model['Within ±10 mmHg (%)']:.1f}%")
-            print(f"   • AAMI Standard: {'✅ PASS' if best_model['AAMI Pass'] else '❌ FAIL'}")
+            print(f"\n🏥 Clinical Validation (Best Model: {best_model['model_name']}):")
+            print(f"   • BHS Grade: {best_model['bhs_grade']}")
+            print(f"   • Within ±5 mmHg: {best_model['within_5_mmhg']:.1f}%")
+            print(f"   • Within ±10 mmHg: {best_model['within_10_mmhg']:.1f}%")
+            print(f"   • AAMI Standard: {'✅ PASS' if best_model['aami_pass'] else '❌ FAIL'}")
     
     # M3 Pro specific optimizations
     print(f"\n⚡ M3 Pro Optimizations Applied:")
