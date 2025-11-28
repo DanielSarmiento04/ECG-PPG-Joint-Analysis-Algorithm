@@ -1,0 +1,41 @@
+# Blood Pressure Estimation Pipeline Configuration
+
+# General Settings
+sampling_rate: 500  # Hz (VitalDB data is 500Hz)
+random_seed: 42
+output_dir: "./data/processed"
+
+# Stage 2: R-Peak Detection
+rpeak:
+  alpha: 0.4
+  beta: 0.15
+  refractory_period_ms: 250  # Minimum time between beats
+  window_size_sec: 10  # Window for adaptive thresholding
+
+# Stage 3: Wavelet Filtering
+wavelet:
+  family_ecg: "cmor1.5-1.0"
+  family_ppg: "cmor1.5-1.0"
+  # Frequency bands will be adaptive based on HR, but defaults can be set here
+  ecg_band_low_mult: 0.5   # x HR
+  ecg_band_high_mult: 2.0  # x HR
+  ppg_band_low_mult: 0.15  # x HR
+  ppg_band_high_mult: 0.7  # x HR
+
+# Stage 4: Cycle Segmentation & Sync
+segmentation:
+  correlation_threshold: 0.85
+  min_cycle_len_ms: 300
+  max_cycle_len_ms: 1500
+
+# Stage 5: Feature Extraction
+features:
+  ptt_min_ms: 100
+  ptt_max_ms: 500
+  normalize_ppg: true
+
+# Quality Control
+qc:
+  min_signal_quality: 0.7
+  valid_sbp_range: [50, 250]
+  valid_dbp_range: [30, 150]
