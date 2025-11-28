@@ -38,6 +38,8 @@ from torchinfo import summary
 
 from src.models.transformers import PhysiologicalTransformer
 
+from sklearn.preprocessing import LabelEncoder
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -170,31 +172,15 @@ def prepare_data(
     input_length: int,
     train_split: float = 0.9,
     random_seed: int = 42
-) -> Tuple[DataLoader, DataLoader, TorchStandardScaler, TorchStandardScaler]:
+) -> Tuple[DataLoader, DataLoader, TorchStandardScaler, TorchStandardScaler, TorchStandardScaler, list]:
     """
-    Load and prepare ECG/PPG data for training.
+    Load and prepare ECG/PPG data for training with hybrid inputs.
     
-    Loads data from Excel file, normalizes features and targets,
-    and creates train/test data loaders with proper shuffling.
+    Loads data from Excel/CSV file, normalizes features and targets,
+    encodes categorical variables, and creates train/test data loaders.
     
-    Data Format:
-        - Columns 6 to 6+input_length: Signal features (ECG/PPG waveform)
-        - Columns 3 to 5: Target values (e.g., SBP and DBP)
-    
-    Args:
-        data_path: Path to Excel file containing the dataset
-        device: PyTorch device for tensor operations
-        batch_size: Batch size for data loaders
-        input_length: Length of input signal (number of time steps)
-        train_split: Fraction of data to use for training (default: 0.9)
-        random_seed: Random seed for reproducibility (default: 42)
-        
     Returns:
-        Tuple of (train_loader, test_loader, y_scaler, X_scaler)
-        
-    Raises:
-        FileNotFoundError: If data_path doesn't exist
-        ValueError: If data has incorrect shape or missing values
+        Tuple of (train_loader, test_loader, y_scaler, X_scaler, num_scaler, cardinalities)
     """
     logger.info(f"Loading data from {data_path}")
     
@@ -207,55 +193,93 @@ def prepare_data(
         df = pd.read_excel(data_path)
     logger.info(f"Loaded {len(df)} samples")
     
-    # Extract features and targets
-    # Features: ptt_peak_to_peak, ptt_peak_to_foot, ptt_peak_to_maxslope, amplitude_ratio_ra, systolic_duration_tsd, diastolic_duration_tfd, time_to_maxslope_t1
+    # --- 1. Signal Features ---
     feature_cols = ['ptt_peak_to_peak', 'ptt_peak_to_foot', 'ptt_peak_to_maxslope', 'amplitude_ratio_ra', 'systolic_duration_tsd', 'diastolic_duration_tfd', 'time_to_maxslope_t1']
     target_cols = ['sbp_reference', 'dbp_reference']
     
-    if all(col in df.columns for col in feature_cols) and all(col in df.columns for col in target_cols):
-        logger.info("Using named columns for features and targets")
-        X = torch.tensor(df[feature_cols].values, dtype=torch.float32, device=device)
-        y = torch.tensor(df[target_cols].values, dtype=torch.float32, device=device)
-    else:
-        logger.warning("Named columns not found, falling back to indices (assuming legacy format)")
-        X = torch.tensor(df.iloc[:, 6:6+input_length].values, dtype=torch.float32, device=device)
-        y = torch.tensor(df.iloc[:, 3:5].values, dtype=torch.float32, device=device)
+    # --- 2. Numerical Metadata ---
+    # age, bmi, hr_bpm
+    num_meta_cols = ['age', 'bmi', 'hr_bpm']
     
-    # Check for NaN or Inf values
-    if torch.isnan(X).any() or torch.isinf(X).any():
-        logger.warning("Found NaN or Inf values in X, replacing with zeros")
-        X = torch.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    # --- 3. Categorical Metadata ---
+    # sex, position, approach, aline1, preop_ecg
+    cat_meta_cols = ['sex', 'position', 'approach', 'aline1', 'preop_ecg']
     
-    if torch.isnan(y).any() or torch.isinf(y).any():
-        logger.warning("Found NaN or Inf values in y, replacing with zeros")
-        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    # Check columns exist
+    all_cols = feature_cols + target_cols + num_meta_cols + cat_meta_cols
+    missing_cols = [c for c in all_cols if c not in df.columns]
+    if missing_cols:
+        logger.warning(f"Missing columns: {missing_cols}. Filling with defaults.")
+        for c in missing_cols:
+            if c in num_meta_cols:
+                df[c] = 0.0
+            elif c in cat_meta_cols:
+                df[c] = 'Unknown'
     
-    # Fit scalers on full data (note: in production, fit only on training data)
-    X_scaler = TorchStandardScaler(device).fit(X)
+    # Extract Tensors
+    X_signal = torch.tensor(df[feature_cols].values, dtype=torch.float32, device=device)
+    y = torch.tensor(df[target_cols].values, dtype=torch.float32, device=device)
+    X_num = torch.tensor(df[num_meta_cols].fillna(0).values, dtype=torch.float32, device=device)
+    
+    # Process Categorical
+    X_cat_list = []
+    cardinalities = []
+    for col in cat_meta_cols:
+        le = LabelEncoder()
+        # Fill NaNs with 'Unknown' and convert to string
+        col_data = df[col].fillna('Unknown').astype(str).values
+        encoded = le.fit_transform(col_data)
+        X_cat_list.append(torch.tensor(encoded, dtype=torch.long, device=device).unsqueeze(1))
+        cardinalities.append(len(le.classes_))
+        logger.info(f"Categorical '{col}': {len(le.classes_)} classes")
+        
+    X_cat = torch.cat(X_cat_list, dim=1)
+    
+    # Handle NaNs/Infs in numerical data
+    for tensor_name, tensor in [('X_signal', X_signal), ('y', y), ('X_num', X_num)]:
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            logger.warning(f"Found NaN/Inf in {tensor_name}, replacing with zeros")
+            tensor.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Fit scalers
+    X_scaler = TorchStandardScaler(device).fit(X_signal)
     y_scaler = TorchStandardScaler(device).fit(y)
+    num_scaler = TorchStandardScaler(device).fit(X_num)
     
-    # Normalize data
-    X_normalized = X_scaler.transform(X).unsqueeze(1)  # Add channel dimension
-    y_normalized = y_scaler.transform(y)
+    # Normalize
+    X_signal_norm = X_scaler.transform(X_signal).unsqueeze(1)
+    y_norm = y_scaler.transform(y)
+    X_num_norm = num_scaler.transform(X_num)
     
-    # Split data with reproducible shuffling
-    total_size = X_normalized.size(0)
+    # Split
+    total_size = X_signal_norm.size(0)
     train_size = int(train_split * total_size)
     
-    # Set seed for reproducibility
     torch.manual_seed(random_seed)
     indices = torch.randperm(total_size, device=device)
     
-    # Create data loaders
-    train_dataset = TensorDataset(X_normalized[indices[:train_size]], y_normalized[indices[:train_size]])
-    test_dataset = TensorDataset(X_normalized[indices[train_size:]], y_normalized[indices[train_size:]])
+    train_idx = indices[:train_size]
+    test_idx = indices[train_size:]
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
+    train_dataset = TensorDataset(
+        X_signal_norm[train_idx], 
+        X_num_norm[train_idx], 
+        X_cat[train_idx], 
+        y_norm[train_idx]
+    )
+    test_dataset = TensorDataset(
+        X_signal_norm[test_idx], 
+        X_num_norm[test_idx], 
+        X_cat[test_idx], 
+        y_norm[test_idx]
+    )
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     logger.info(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
     
-    return train_loader, test_loader, y_scaler, X_scaler
+    return train_loader, test_loader, y_scaler, X_scaler, num_scaler, cardinalities
 
 def evaluate_model(
     model: nn.Module, 
@@ -265,21 +289,6 @@ def evaluate_model(
 ) -> Dict[str, float]:
     """
     Evaluate model on test set with comprehensive metrics.
-    
-    Computes multiple regression metrics:
-    - MSE Loss: Mean Squared Error
-    - RMSE: Root Mean Squared Error
-    - MAE: Mean Absolute Error
-    - R² Score: Coefficient of determination
-    
-    Args:
-        model: Trained neural network model
-        test_loader: DataLoader for test data
-        criterion: Loss function (typically MSELoss)
-        device: Device for computation
-        
-    Returns:
-        Dictionary containing evaluation metrics
     """
     model.eval()
     total_loss = 0.0
@@ -287,9 +296,13 @@ def evaluate_model(
     all_predictions = []
     
     with torch.no_grad():
-        for inputs, targets in test_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            predictions = model(inputs)
+        for inputs, x_num, x_cat, targets in test_loader:
+            inputs = inputs.to(device)
+            x_num = x_num.to(device)
+            x_cat = x_cat.to(device)
+            targets = targets.to(device)
+            
+            predictions = model(inputs, x_num, x_cat)
             loss = criterion(predictions, targets)
             total_loss += loss.item()
             all_targets.append(targets.cpu().numpy())
@@ -379,7 +392,7 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     
     # Load and prepare data
-    train_loader, test_loader, y_scaler, X_scaler = prepare_data(
+    train_loader, test_loader, y_scaler, X_scaler, num_scaler, cardinalities = prepare_data(
         args.data_path, device, args.batch_size, args.input_length
     )
     
@@ -393,12 +406,14 @@ def main():
         num_outputs=2,  # SBP and DBP
         dropout=args.dropout,
         attention_dropout=0.0,
-        input_length=args.input_length
+        input_length=args.input_length,
+        num_numerical_features=3, # age, bmi, hr_bpm
+        categorical_cardinalities=cardinalities
     ).to(device)
     
     # Print model summary
     logger.info("\nModel Architecture:")
-    summary(model, input_size=(args.batch_size, 1, args.input_length))
+    # summary(model, input_size=(args.batch_size, 1, args.input_length)) # Summary might fail with multiple inputs
     
     # Loss function and optimizer
     criterion = nn.MSELoss()
@@ -422,15 +437,18 @@ def main():
         total_loss = 0.0
         
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}')
-        for inputs, targets in pbar:
-            inputs, targets = inputs.to(device), targets.to(device)
+        for inputs, x_num, x_cat, targets in pbar:
+            inputs = inputs.to(device)
+            x_num = x_num.to(device)
+            x_cat = x_cat.to(device)
+            targets = targets.to(device)
             
             optimizer.zero_grad()
             
             # Forward pass with mixed precision
             if args.use_amp and scaler is not None:
                 with torch.cuda.amp.autocast():
-                    predictions = model(inputs)
+                    predictions = model(inputs, x_num, x_cat)
                     loss = criterion(predictions, targets)
                 
                 # Backward pass with gradient scaling
@@ -444,7 +462,7 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                predictions = model(inputs)
+                predictions = model(inputs, x_num, x_cat)
                 loss = criterion(predictions, targets)
                 loss.backward()
                 
@@ -493,7 +511,10 @@ def main():
                 'best_r2': best_r2,
                 'args': vars(args),
                 'y_scaler_mean': y_scaler.mean,
-                'y_scaler_std': y_scaler.std
+                'y_scaler_std': y_scaler.std,
+                'num_scaler_mean': num_scaler.mean,
+                'num_scaler_std': num_scaler.std,
+                'cardinalities': cardinalities
             }
             torch.save(checkpoint, os.path.join(args.save_dir, 'best_model.pt'))
             logger.info(f"  ✓ New best R² score: {best_r2:.4f} - Model saved!")

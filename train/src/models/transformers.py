@@ -125,7 +125,7 @@ class PhysiologicalTransformer(nn.Module):
     Transformer model for Physiological Signal Analysis (ECG/PPG)
     
     Can handle both sequential waveform data and feature vectors.
-    For feature vectors, set patch_size=1 and input_length=num_features.
+    Incorporates patient metadata (numerical and categorical) for hybrid modeling.
     
     Args:
         patch_size: Size of each patch (1 for feature vectors)
@@ -135,11 +135,14 @@ class PhysiologicalTransformer(nn.Module):
         mlp_dim: Dimension of the MLP layer
         num_outputs: Number of output values (e.g., 2 for SBP and DBP)
         dropout: Dropout rate
-        attention_dropout: Attention dropout rate (unused but kept for compatibility)
+        attention_dropout: Attention dropout rate
         input_length: Length of input signal or number of features
+        num_numerical_features: Number of extra numerical features (age, bmi, etc.)
+        categorical_cardinalities: List of integers representing the number of classes for each categorical feature
     """
     def __init__(self, patch_size, hidden_size, depth, num_heads, mlp_dim, 
-                 num_outputs, dropout=0.1, attention_dropout=0.0, input_length=400):
+                 num_outputs, dropout=0.1, attention_dropout=0.0, input_length=400,
+                 num_numerical_features=0, categorical_cardinalities=None):
         super().__init__()
         
         assert input_length % patch_size == 0, f"input_length ({input_length}) must be divisible by patch_size ({patch_size})"
@@ -162,8 +165,30 @@ class PhysiologicalTransformer(nn.Module):
         # Layer norm
         self.norm = nn.LayerNorm(hidden_size)
         
-        # Classification head
-        self.head = nn.Linear(hidden_size, num_outputs)
+        # --- Metadata Processing ---
+        self.num_numerical_features = num_numerical_features
+        self.categorical_cardinalities = categorical_cardinalities or []
+        
+        # Embeddings for categorical features
+        # Rule of thumb for embedding dim: min(50, (cardinality + 1) // 2)
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(card, min(50, (card + 1) // 2))
+            for card in self.categorical_cardinalities
+        ])
+        
+        total_embedding_dim = sum(e.embedding_dim for e in self.embeddings)
+        
+        # Fusion Layer
+        # Concatenates: [Transformer_Output, Numerical_Features, Categorical_Embeddings]
+        fusion_input_dim = hidden_size + num_numerical_features + total_embedding_dim
+        
+        # Classification head (Updated for fusion)
+        self.head = nn.Sequential(
+            nn.Linear(fusion_input_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_outputs)
+        )
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
@@ -181,17 +206,22 @@ class PhysiologicalTransformer(nn.Module):
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, std=0.02)
     
-    def forward(self, x):
+    def forward(self, x, x_numeric=None, x_categorical=None):
         """
         Forward pass
         
         Args:
-            x: Input tensor of shape (batch_size, 1, input_length)
+            x: Signal input tensor of shape (batch_size, 1, input_length)
+            x_numeric: Optional numerical metadata (batch_size, num_numerical_features)
+            x_categorical: Optional categorical metadata (batch_size, num_categorical_features)
             
         Returns:
             Output tensor of shape (batch_size, num_outputs)
         """
+        # --- Transformer Path ---
         # Patch embedding
         x = self.patch_embedding(x)
         x = self.dropout(x)
@@ -203,10 +233,31 @@ class PhysiologicalTransformer(nn.Module):
         # Apply final layer norm
         x = self.norm(x)
         
-        # Use class token for prediction
+        # Use class token as the signal representation
         cls_token = x[:, 0]
         
-        # Classification head
-        output = self.head(cls_token)
+        # --- Fusion ---
+        features = [cls_token]
+        
+        # Add numerical metadata
+        if self.num_numerical_features > 0:
+            if x_numeric is None:
+                raise ValueError("Model expects x_numeric input but none provided")
+            features.append(x_numeric)
+            
+        # Add categorical embeddings
+        if len(self.categorical_cardinalities) > 0:
+            if x_categorical is None:
+                raise ValueError("Model expects x_categorical input but none provided")
+            for i, embedding_layer in enumerate(self.embeddings):
+                # Get embedding for each categorical feature
+                # x_categorical[:, i] contains indices for the i-th feature
+                features.append(embedding_layer(x_categorical[:, i]))
+        
+        # Concatenate all features
+        combined = torch.cat(features, dim=1)
+        
+        # Final prediction
+        output = self.head(combined)
         
         return output
