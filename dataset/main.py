@@ -80,7 +80,8 @@ class VitalDBDownloader:
         self.clinical_params = [
             'caseid', 'age', 'sex', 'height', 'weight', 'bmi',
             'preop_htn', 'preop_dm', 'asa', 'optype',
-            'ane_type', 'department'
+            'ane_type', 'department',
+            'position', 'approach', 'aline1', 'dx', 'opname', 'preop_ecg'
         ]
     
     def get_available_cases(self, min_duration_min: int = 30) -> pd.DataFrame:

@@ -507,6 +507,11 @@ class BPEstimationPipeline:
             df_features['patient_id'] = data['metadata'].get('caseid', 'unknown')
             df_features['session_id'] = data['filename']
             
+            # Clinical metadata
+            meta = data['metadata']
+            for col in ['age', 'sex', 'bmi', 'position', 'approach', 'aline1', 'dx', 'opname', 'preop_ecg']:
+                df_features[col] = meta.get(col, np.nan if col in ['age', 'bmi'] else 'unknown')
+            
         return df_features
 
     def run_batch(self, data_dir: str, max_files: Optional[int] = None):

@@ -2,7 +2,7 @@
 
 This directory contains a complete pipeline for downloading, processing, and analyzing physiological waveform data from VitalDB for cuffless blood pressure estimation research.
 
-## 📋 Overview
+## Overview
 
 The project implements a robust signal processing pipeline to extract high-quality features from ECG and PPG signals. It includes:
 1.  **Data Acquisition**: Downloading raw waveforms from VitalDB.
@@ -10,7 +10,7 @@ The project implements a robust signal processing pipeline to extract high-quali
 3.  **Feature Extraction**: Calculation of Pulse Transit Time (PTT) and morphological features.
 4.  **Analysis**: Statistical analysis and visualization of the extracted dataset.
 
-## 🗂️ Directory Structure
+## Directory Structure
 
 ```
 dataset/
@@ -36,7 +36,7 @@ dataset/
     └── vitaldb_download.log   # Download logs
 ```
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 
@@ -92,7 +92,7 @@ python feature_analysis.py
 *   `correlation_matrix.png`: Feature correlation heatmap.
 *   `ptt_vs_bp.png`: Scatter plots of PTT vs. Blood Pressure.
 
-## ⚙️ Pipeline Methodology
+## Pipeline Methodology
 
 The `BPEstimationPipeline` (in `bp_pipeline.py`) implements the following steps:
 
@@ -111,7 +111,7 @@ The `BPEstimationPipeline` (in `bp_pipeline.py`) implements the following steps:
     *   **Amplitude_Ratio**: Ratio of systolic to diastolic amplitude.
     *   **Durations**: Systolic and diastolic phase durations.
 
-## 📊 Dataset Statistics (Current Batch)
+## Dataset Statistics (Current Batch)
 
 *   **Total Processed Cases**: 48
 *   **Total Valid Cycles**: ~45,300
@@ -121,7 +121,7 @@ The `BPEstimationPipeline` (in `bp_pipeline.py`) implements the following steps:
 *   **Mean HR**: 88.3 ± 12.1 BPM
 *   **Signal Quality**: Mean cycle correlation of **0.94**.
 
-## 🔧 Data Format
+## Data Format
 
 ### Processed Features (`bp_dataset_features.csv`)
 
@@ -136,7 +136,20 @@ The `BPEstimationPipeline` (in `bp_pipeline.py`) implements the following steps:
 | `hr_bpm` | Heart Rate | BPM |
 | `cycle_correlation` | Correlation with patient's template beat | 0-1 |
 
-## ⚠️ Known Issues & Solutions
+### Categorical Metadata
+
+The dataset now includes detailed categorical metadata to improve model robustness:
+
+| Column | Description | Examples |
+|--------|-------------|----------|
+| `position` | Patient body position during surgery | Supine, Lithotomy, Trendelenburg |
+| `approach` | Surgical approach | Open, Videoscopic, Robotic |
+| `aline1` | Arterial line location (affects waveform shape) | Right radial, Left radial, Femoral |
+| `dx` | Primary diagnosis | Hypertension, Trauma, Cancer |
+| `opname` | Name of the operation | Laparoscopic Cholecystectomy |
+| `preop_ecg` | Pre-operative ECG status | Normal Sinus Rhythm, Atrial Fibrillation |
+
+## Known Issues & Solutions
 
 ### Issue 1: PyWavelets Freezing
 **Problem:** `cwt` with `method='conv'` freezes on large arrays.
@@ -146,13 +159,13 @@ The `BPEstimationPipeline` (in `bp_pipeline.py`) implements the following steps:
 **Problem:** `np.corrcoef` on large matrices ($N^2$ complexity) caused crashes.
 **Solution:** Replaced with $O(N)$ dot-product correlation against a median template.
 
-## 📚 References
+## References
 
 - **VitalDB:** https://vitaldb.net/
 - **VitalDB Paper:** Lee HC, Jung CW. Vital Recorder—a free research tool for automatic recording of high-resolution time-synchronised physiological data from multiple anaesthesia devices. Sci Rep. 2018;8:1527.
 - **API Documentation:** https://vitaldb.net/dataset/?query=lib
 
-## 📝 Citation
+## Citation
 
 If you use this data in your research, please cite:
 
@@ -169,19 +182,19 @@ If you use this data in your research, please cite:
 }
 ```
 
-## 🤝 Contributing
+## Contributing
 
 For issues, questions, or contributions:
 1. Check existing issues
 2. Open new issue with detailed description
 3. Include error logs and system information
 
-## 📄 License
+## License
 
 This code is for research purposes. VitalDB data is subject to VitalDB's terms of use.
 
 ---
 
-**Last Updated:** November 24, 2025  
+**Last Updated:** November 28, 2025  
 **VitalDB API Version:** 1.5.8  
-**Python Version:** 3.8+
+**Python Version:** 3.10+
