@@ -37,6 +37,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torchinfo import summary
 
 from src.models.transformers import PhysiologicalTransformer
+from src.utils.hardware import get_device
 
 from sklearn.preprocessing import LabelEncoder
 
@@ -216,6 +217,17 @@ def prepare_data(
             elif c in cat_meta_cols:
                 df[c] = 'Unknown'
     
+    # --- Feature Engineering: Interaction Features ---
+    # PTT / Height (using BMI as proxy for body size if height not available)
+    # PTT * Age
+    if 'age' in df.columns and 'ptt_peak_to_peak' in df.columns:
+        df['interaction_ptt_age'] = df['ptt_peak_to_peak'] * df['age']
+        num_meta_cols.append('interaction_ptt_age')
+        
+    if 'bmi' in df.columns and 'ptt_peak_to_peak' in df.columns:
+        df['interaction_ptt_bmi'] = df['ptt_peak_to_peak'] / (df['bmi'] + 1e-6)
+        num_meta_cols.append('interaction_ptt_bmi')
+
     # Extract Tensors
     X_signal = torch.tensor(df[feature_cols].values, dtype=torch.float32, device=device)
     y = torch.tensor(df[target_cols].values, dtype=torch.float32, device=device)
@@ -330,6 +342,8 @@ def evaluate_model(
         'r2_output_1': r2_per_output[1] if len(r2_per_output) > 1 else 0.0
     }
 
+
+
 def main():
     """Main training loop with advanced techniques."""
     parser = argparse.ArgumentParser(description='Train Vision Transformer for ECG/PPG signal analysis')
@@ -345,13 +359,13 @@ def main():
     # Model architecture
     parser.add_argument('--patch_size', type=int, default=1,
                        help='Size of each patch (1 for feature vectors)')
-    parser.add_argument('--hidden_size', type=int, default=64,
+    parser.add_argument('--hidden_size', type=int, default=128,
                        help='Dimension of hidden representations')
-    parser.add_argument('--depth', type=int, default=6,
+    parser.add_argument('--depth', type=int, default=8,
                        help='Number of transformer blocks')
     parser.add_argument('--num_heads', type=int, default=8,
                        help='Number of attention heads')
-    parser.add_argument('--mlp_dim', type=int, default=128,
+    parser.add_argument('--mlp_dim', type=int, default=256,
                        help='Dimension of MLP layer')
     parser.add_argument('--dropout', type=float, default=0.1,
                        help='Dropout rate')
@@ -385,7 +399,7 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
     
     # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = get_device()
     logger.info(f"Using device: {device}")
     
     # Create checkpoint directory
@@ -397,6 +411,13 @@ def main():
     )
     
     # Initialize model
+    # Determine number of numerical features dynamically from the scaler
+    # num_scaler.mean is a tensor of shape (1, num_features)
+    if num_scaler.mean is not None:
+        num_numerical_features = num_scaler.mean.shape[1]
+    else:
+        num_numerical_features = 3 # Fallback default
+        
     model = PhysiologicalTransformer(
         patch_size=args.patch_size,
         hidden_size=args.hidden_size,
@@ -407,7 +428,7 @@ def main():
         dropout=args.dropout,
         attention_dropout=0.0,
         input_length=args.input_length,
-        num_numerical_features=3, # age, bmi, hr_bpm
+        num_numerical_features=num_numerical_features, 
         categorical_cardinalities=cardinalities
     ).to(device)
     
@@ -416,7 +437,8 @@ def main():
     # summary(model, input_size=(args.batch_size, 1, args.input_length)) # Summary might fail with multiple inputs
     
     # Loss function and optimizer
-    criterion = nn.MSELoss()
+    # Use Huber Loss for robustness to outliers
+    criterion = nn.HuberLoss(delta=1.0)
     optimizer, scheduler = create_optimizer_and_scheduler(model, args, len(train_loader) * args.epochs)
     
     # Mixed precision training
