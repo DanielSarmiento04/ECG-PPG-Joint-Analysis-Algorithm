@@ -19,6 +19,7 @@ dataset/
 ├── bp_pipeline.py             # Core signal processing pipeline class
 ├── run_full_batch.py          # Batch processing script for all cases
 ├── feature_analysis.py        # Feature visualization and analysis
+├── analyze_categorical.py     # Categorical variable analysis script
 ├── pipeline_config.yaml       # Configuration parameters
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
@@ -91,6 +92,21 @@ python feature_analysis.py
 *   `feature_distributions.png`: Distributions of PTT and other features.
 *   `correlation_matrix.png`: Feature correlation heatmap.
 *   `ptt_vs_bp.png`: Scatter plots of PTT vs. Blood Pressure.
+
+### 4. Analyze Categorical Variables
+
+Evaluate the impact of clinical metadata (Position, Approach, etc.) on Blood Pressure:
+
+```bash
+python analyze_categorical.py
+```
+
+**Outputs (in `./data/figures/`):**
+*   `bp_by_position.png`: Boxplots of BP by patient position.
+*   `bp_by_approach.png`: Boxplots of BP by surgical approach.
+*   `bp_by_aline1.png`: Boxplots of BP by arterial line location.
+*   `bp_by_preop_ecg.png`: Boxplots of BP by pre-op ECG status.
+*   **Console Output**: ANOVA statistical test results for each category.
 
 ## Pipeline Methodology
 
