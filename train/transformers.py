@@ -438,6 +438,8 @@ def main():
                        help='Dimension of MLP layer')
     parser.add_argument('--dropout', type=float, default=0.2,
                        help='Dropout rate')
+    parser.add_argument('--att_dropout', type=float, default=0.1,
+                       help='Attention dropout rate')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=200,
@@ -506,7 +508,7 @@ def main():
         mlp_dim=args.mlp_dim,
         num_outputs=2,  # SBP and DBP
         dropout=args.dropout,
-        attention_dropout=0.0,
+        attention_dropout=args.att_dropout,
         input_length=args.input_length,
         num_numerical_features=num_numerical_features, 
         categorical_cardinalities=cardinalities,

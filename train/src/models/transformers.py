@@ -109,18 +109,24 @@ class MultiHeadSelfAttention(nn.Module):
         return output
 
 
+class GEGLU(nn.Module):
+    def forward(self, x):
+        x, gates = x.chunk(2, dim=-1)
+        return x * F.gelu(gates)
+
 class MLP(nn.Module):
-    """Feed-forward network"""
+    """Feed-forward network with GEGLU activation"""
     def __init__(self, hidden_size, mlp_dim, dropout=0.1):
         super().__init__()
-        self.fc1 = nn.Linear(hidden_size, mlp_dim)
+        # GEGLU requires projecting to 2x the inner dimension
+        self.fc1 = nn.Linear(hidden_size, mlp_dim * 2)
+        self.act = GEGLU()
         self.fc2 = nn.Linear(mlp_dim, hidden_size)
         self.dropout = nn.Dropout(dropout)
-        self.activation = nn.GELU()
         
     def forward(self, x):
         x = self.fc1(x)
-        x = self.activation(x)
+        x = self.act(x)
         x = self.dropout(x)
         x = self.fc2(x)
         x = self.dropout(x)
