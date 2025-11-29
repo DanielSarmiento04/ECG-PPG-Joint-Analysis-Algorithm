@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
-from torchinfo import summary
+# from torchinfo import summary
 
 from src.models.transformers import PhysiologicalTransformer
 from src.utils.hardware import get_device
@@ -91,6 +91,62 @@ def create_optimizer_and_scheduler(
         final_div_factor=1e4  # Final lr = max_lr/1e4
     )
     return optimizer, scheduler
+
+class WeightedMSELoss(nn.Module):
+    """
+    Weighted MSE Loss for Blood Pressure Prediction.
+    Emphasizes clinically critical ranges (Hypotensive < 90, Hypertensive > 140).
+    """
+    def __init__(self, device, alpha=1.0, beta=1.0):
+        super().__init__()
+        self.device = device
+        self.alpha = alpha # Weight for SBP
+        self.beta = beta   # Weight for DBP
+        
+    def forward(self, pred, target, y_scaler=None):
+        # pred, target are scaled values
+        # We need unscaled values to determine weights
+        
+        if y_scaler is not None:
+            # Unscale to get mmHg
+            # Note: inverse_transform might detach gradients if not careful, 
+            # but we only need it for weight calculation which doesn't require gradients on weights
+            with torch.no_grad():
+                target_mmhg = y_scaler.inverse_transform(target)
+        else:
+            target_mmhg = target
+            
+        # Calculate weights based on target_mmhg
+        # SBP is index 0, DBP is index 1
+        sbp = target_mmhg[:, 0]
+        dbp = target_mmhg[:, 1]
+        
+        # Weights for SBP
+        w_sbp = torch.ones_like(sbp)
+        w_sbp[sbp < 90] = 2.0
+        w_sbp[sbp > 140] = 2.0
+        w_sbp[sbp < 70] = 3.0
+        w_sbp[sbp > 160] = 3.0
+        
+        # Weights for DBP
+        w_dbp = torch.ones_like(dbp)
+        w_dbp[dbp < 60] = 2.0
+        w_dbp[dbp > 90] = 2.0
+        
+        # Combine weights
+        weights = torch.stack([w_sbp, w_dbp], dim=1)
+        
+        # Apply global task weights (alpha for SBP, beta for DBP)
+        weights[:, 0] *= self.alpha
+        weights[:, 1] *= self.beta
+        
+        # Calculate MSE
+        loss = (pred - target) ** 2
+        
+        # Apply weights
+        weighted_loss = loss * weights
+        
+        return weighted_loss.mean()
 
 class TorchStandardScaler:
     """
@@ -298,7 +354,7 @@ def evaluate_model(
     test_loader: DataLoader, 
     criterion: nn.Module, 
     device: torch.device,
-    y_scaler: TorchStandardScaler = None
+    y_scaler: Optional[TorchStandardScaler] = None
 ) -> Dict[str, float]:
     """
     Evaluate model on test set with comprehensive metrics.
@@ -316,7 +372,13 @@ def evaluate_model(
             targets = targets.to(device)
             
             predictions = model(inputs, x_num, x_cat)
-            loss = criterion(predictions, targets)
+            
+            # Pass y_scaler to criterion if it's WeightedMSELoss
+            if isinstance(criterion, WeightedMSELoss):
+                loss = criterion(predictions, targets, y_scaler)
+            else:
+                loss = criterion(predictions, targets)
+                
             total_loss += loss.item()
             
             # Inverse transform if scaler provided
@@ -362,27 +424,27 @@ def main():
                        help='Path to the dataset file (CSV or Excel)')
     parser.add_argument('--input_length', type=int, default=7,
                        help='Length of input signal or number of features')
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size for training')
     
     # Model architecture
-    parser.add_argument('--hidden_size', type=int, default=128,
+    parser.add_argument('--hidden_size', type=int, default=256,
                        help='Dimension of hidden representations')
     parser.add_argument('--depth', type=int, default=6,
                        help='Number of transformer blocks')
     parser.add_argument('--num_heads', type=int, default=8,
                        help='Number of attention heads')
-    parser.add_argument('--mlp_dim', type=int, default=256,
+    parser.add_argument('--mlp_dim', type=int, default=512,
                        help='Dimension of MLP layer')
-    parser.add_argument('--dropout', type=float, default=0.1,
+    parser.add_argument('--dropout', type=float, default=0.2,
                        help='Dropout rate')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=200,
                        help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=0.001,
+    parser.add_argument('--lr', type=float, default=5e-4,
                        help='Initial learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-4,
+    parser.add_argument('--weight_decay', type=float, default=1e-3,
                        help='Weight decay for regularization')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                        help='Gradient clipping value (0 to disable)')
@@ -390,6 +452,8 @@ def main():
                        help='Early stopping patience')
     parser.add_argument('--use_amp', action='store_true',
                        help='Use automatic mixed precision training')
+    parser.add_argument('--use_film', action='store_true',
+                       help='Use FiLM layers for demographic conditioning')
     parser.add_argument('--evaluate_only', action='store_true',
                        help='Skip training and only evaluate the best model')
     
@@ -404,19 +468,27 @@ def main():
     # Set random seeds for reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
     
     # Setup device
     device = get_device()
     logger.info(f"Using device: {device}")
+    
+    # MPS-specific reproducibility
+    if device.type == 'mps':
+        torch.mps.manual_seed(args.seed)
+    elif device.type == 'cuda':
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.use_deterministic_algorithms(True, warn_only=True)
     
     # Create checkpoint directory
     os.makedirs(args.save_dir, exist_ok=True)
     
     # Load and prepare data
     train_loader, test_loader, y_scaler, X_scaler, num_scaler, cardinalities = prepare_data(
-        args.data_path, device, args.batch_size, args.input_length
+        args.data_path, device, args.batch_size, args.input_length, random_seed=args.seed
     )
     
     # Initialize model
@@ -437,7 +509,8 @@ def main():
         attention_dropout=0.0,
         input_length=args.input_length,
         num_numerical_features=num_numerical_features, 
-        categorical_cardinalities=cardinalities
+        categorical_cardinalities=cardinalities,
+        use_film=args.use_film
     ).to(device)
     
     # Print model summary
@@ -445,8 +518,8 @@ def main():
     # summary(model, input_size=(args.batch_size, 1, args.input_length)) # Summary might fail with multiple inputs
     
     # Loss function and optimizer
-    # Use Huber Loss for robustness to outliers
-    criterion = nn.HuberLoss(delta=1.0)
+    # Use Weighted MSE Loss for clinical relevance
+    criterion = WeightedMSELoss(device=device)
     optimizer, scheduler = create_optimizer_and_scheduler(model, args, len(train_loader) * args.epochs)
     
     # Mixed precision training
@@ -483,7 +556,7 @@ def main():
             if args.use_amp and scaler is not None:
                 with torch.cuda.amp.autocast():
                     predictions = model(inputs, x_num, x_cat)
-                    loss = criterion(predictions, targets)
+                    loss = criterion(predictions, targets, y_scaler)
                 
                 # Backward pass with gradient scaling
                 scaler.scale(loss).backward()
@@ -497,7 +570,7 @@ def main():
                 scaler.update()
             else:
                 predictions = model(inputs, x_num, x_cat)
-                loss = criterion(predictions, targets)
+                loss = criterion(predictions, targets, y_scaler)
                 loss.backward()
                 
                 # Gradient clipping

@@ -19,10 +19,13 @@ class FeatureTokenizer(nn.Module):
         self.num_categorical = len(categorical_cardinalities)
         self.hidden_size = hidden_size
         
-        # Numerical feature embeddings: One linear layer per feature
-        # Projects scalar value to hidden_size vector
+        # Numerical feature embeddings: MLP per feature for better representation
         self.numerical_embeddings = nn.ModuleList([
-            nn.Linear(1, hidden_size) for _ in range(num_numerical_features)
+            nn.Sequential(
+                nn.Linear(1, hidden_size),
+                nn.GELU(),
+                nn.Linear(hidden_size, hidden_size)
+            ) for _ in range(num_numerical_features)
         ])
         
         # Categorical feature embeddings
@@ -124,19 +127,49 @@ class MLP(nn.Module):
         return x
 
 
+class FiLMLayer(nn.Module):
+    """
+    Feature-wise Linear Modulation (FiLM) layer.
+    Conditions the network on demographic/contextual information.
+    """
+    def __init__(self, condition_dim, hidden_size):
+        super().__init__()
+        self.scale = nn.Linear(condition_dim, hidden_size)
+        self.shift = nn.Linear(condition_dim, hidden_size)
+        
+    def forward(self, x, condition):
+        # x: (batch, seq_len, hidden_size)
+        # condition: (batch, condition_dim)
+        gamma = self.scale(condition).unsqueeze(1)  # (batch, 1, hidden_size)
+        beta = self.shift(condition).unsqueeze(1)   # (batch, 1, hidden_size)
+        return gamma * x + beta
+
+
 class TransformerBlock(nn.Module):
-    """Single transformer encoder block"""
-    def __init__(self, hidden_size, num_heads, mlp_dim, dropout=0.1):
+    """Single transformer encoder block with optional FiLM conditioning"""
+    def __init__(self, hidden_size, num_heads, mlp_dim, dropout=0.1, use_film=False, condition_dim=0):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size)
         self.attention = MultiHeadSelfAttention(hidden_size, num_heads, dropout)
         self.norm2 = nn.LayerNorm(hidden_size)
         self.mlp = MLP(hidden_size, mlp_dim, dropout)
         
-    def forward(self, x):
+        self.use_film = use_film
+        if use_film:
+            self.film = FiLMLayer(condition_dim, hidden_size)
+        
+    def forward(self, x, condition=None):
         # Pre-norm architecture
-        x = x + self.attention(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x_norm1 = self.norm1(x)
+        x = x + self.attention(x_norm1)
+        
+        x_norm2 = self.norm2(x)
+        
+        # Apply FiLM before MLP if enabled
+        if self.use_film and condition is not None:
+            x_norm2 = self.film(x_norm2, condition)
+            
+        x = x + self.mlp(x_norm2)
         return x
 
 
@@ -151,11 +184,13 @@ class PhysiologicalTransformer(nn.Module):
     """
     def __init__(self, hidden_size, depth, num_heads, mlp_dim, 
                  num_outputs, dropout=0.1, attention_dropout=0.0, input_length=7,
-                 num_numerical_features=0, categorical_cardinalities=None):
+                 num_numerical_features=0, categorical_cardinalities=None,
+                 use_film=False):
         super().__init__()
         
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.use_film = use_film
         
         # Total numerical features = Signal Features + Metadata Numerical Features
         total_numerical = input_length + num_numerical_features
@@ -168,21 +203,52 @@ class PhysiologicalTransformer(nn.Module):
             hidden_size=hidden_size
         )
         
+        # Condition dimension for FiLM (if used)
+        # We'll use a simple embedding of demographics for conditioning
+        self.condition_dim = 0
+        if use_film:
+            # We assume condition comes from metadata embeddings
+            # For simplicity, we'll project flattened metadata tokens to condition_dim
+            # Or we can learn a condition vector from x_numeric and x_categorical
+            # Here we will use a separate encoder for condition
+            self.condition_dim = 32 # Arbitrary dimension for condition vector
+            
+            # Simple encoder for numerical metadata
+            self.num_cond_encoder = nn.Linear(num_numerical_features, self.condition_dim)
+            
+            # Embeddings for categorical metadata for conditioning
+            self.cat_cond_embeddings = nn.ModuleList([
+                nn.Embedding(card, 4) for card in self.categorical_cardinalities
+            ])
+            cat_cond_dim = len(self.categorical_cardinalities) * 4
+            
+            self.condition_proj = nn.Linear(self.condition_dim + cat_cond_dim, self.condition_dim)
+
+        
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(hidden_size, num_heads, mlp_dim, dropout)
+            TransformerBlock(hidden_size, num_heads, mlp_dim, dropout, use_film, self.condition_dim)
             for _ in range(depth)
         ])
         
         # Layer norm
         self.norm = nn.LayerNorm(hidden_size)
         
-        # Final prediction head (from CLS token)
-        self.head = nn.Sequential(
+        # Dual prediction heads (SBP and DBP)
+        # SBP Head
+        self.head_sbp = nn.Sequential(
             nn.Linear(hidden_size, mlp_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(mlp_dim, num_outputs)
+            nn.Linear(mlp_dim, 1)
+        )
+        
+        # DBP Head
+        self.head_dbp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, 1)
         )
         
         # Wide Component (Linear Skip Connection)
@@ -228,9 +294,30 @@ class PhysiologicalTransformer(nn.Module):
         # Tokenize all inputs
         x = self.tokenizer(x_all_num, x_categorical)
         
+        # Prepare condition for FiLM
+        condition = None
+        if self.use_film and x_numeric is not None:
+            # Encode numerical metadata
+            # Note: x_numeric here is the raw (normalized) values
+            cond_num = self.num_cond_encoder(x_numeric)
+            
+            # Encode categorical metadata
+            cond_cats = []
+            if x_categorical is not None:
+                for i, emb in enumerate(self.cat_cond_embeddings):
+                    cond_cats.append(emb(x_categorical[:, i]))
+            
+            if cond_cats:
+                cond_cat = torch.cat(cond_cats, dim=1)
+                condition = torch.cat([cond_num, cond_cat], dim=1)
+            else:
+                condition = cond_num
+                
+            condition = self.condition_proj(condition)
+        
         # Apply transformer blocks
         for block in self.blocks:
-            x = block(x)
+            x = block(x, condition)
         
         # Apply final layer norm
         x = self.norm(x)
@@ -238,13 +325,15 @@ class PhysiologicalTransformer(nn.Module):
         # Use CLS token (index 0) for prediction
         cls_token = x[:, 0]
         
-        # Deep prediction
-        deep_out = self.head(cls_token)
+        # Dual prediction
+        sbp_out = self.head_sbp(cls_token)
+        dbp_out = self.head_dbp(cls_token)
         
         # Wide prediction (Linear Skip)
         wide_out = self.wide_linear(x_all_num)
         
         # Final prediction = Deep + Wide
-        output = deep_out + wide_out
+        # wide_out is (batch, 2), sbp_out/dbp_out are (batch, 1)
+        output = torch.cat([sbp_out, dbp_out], dim=1) + wide_out
         
         return output
