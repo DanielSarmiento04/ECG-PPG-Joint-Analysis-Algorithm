@@ -297,7 +297,8 @@ def evaluate_model(
     model: nn.Module, 
     test_loader: DataLoader, 
     criterion: nn.Module, 
-    device: torch.device
+    device: torch.device,
+    y_scaler: TorchStandardScaler = None
 ) -> Dict[str, float]:
     """
     Evaluate model on test set with comprehensive metrics.
@@ -317,6 +318,12 @@ def evaluate_model(
             predictions = model(inputs, x_num, x_cat)
             loss = criterion(predictions, targets)
             total_loss += loss.item()
+            
+            # Inverse transform if scaler provided
+            if y_scaler is not None:
+                targets = y_scaler.inverse_transform(targets)
+                predictions = y_scaler.inverse_transform(predictions)
+                
             all_targets.append(targets.cpu().numpy())
             all_predictions.append(predictions.cpu().numpy())
     
@@ -325,7 +332,9 @@ def evaluate_model(
     all_predictions = np.vstack(all_predictions)
     
     # Calculate metrics
-    mse = total_loss / len(test_loader)
+    # Note: MSE/Loss here is on the scaled data if y_scaler is None, or unscaled if provided
+    # But total_loss above is always on scaled data (as per training objective)
+    
     rmse = np.sqrt(mean_squared_error(all_targets, all_predictions))
     mae = mean_absolute_error(all_targets, all_predictions)
     r2 = r2_score(all_targets, all_predictions)
@@ -334,7 +343,7 @@ def evaluate_model(
     r2_per_output = r2_score(all_targets, all_predictions, multioutput='raw_values')
     
     return {
-        'loss': mse,
+        'loss': total_loss / len(test_loader), # Keep loss on scaled data for consistency
         'rmse': rmse,
         'mae': mae,
         'r2': r2,
@@ -500,7 +509,7 @@ def main():
         avg_train_loss = total_loss / len(train_loader)
         
         # Evaluation phase
-        metrics = evaluate_model(model, test_loader, criterion, device)
+        metrics = evaluate_model(model, test_loader, criterion, device, y_scaler)
         
         # Store metrics
         train_losses.append(avg_train_loss)
@@ -512,8 +521,8 @@ def main():
             f"Epoch {epoch+1}/{args.epochs} - "
             f"Train Loss: {avg_train_loss:.4f}, "
             f"Test Loss: {metrics['loss']:.4f}, "
-            f"RMSE: {metrics['rmse']:.4f}, "
-            f"MAE: {metrics['mae']:.4f}, "
+            f"RMSE: {metrics['rmse']:.4f} mmHg, "
+            f"MAE: {metrics['mae']:.4f} mmHg, "
             f"R²: {metrics['r2']:.4f}"
         )
         
@@ -547,6 +556,106 @@ def main():
     
     # Plot training curves
     plot_training_curves(train_losses, test_losses, r2_scores, args.save_dir)
+    
+    # --- Final Evaluation & Prediction Saving ---
+    logger.info("\nLoading best model for final evaluation and prediction saving...")
+    checkpoint = torch.load(os.path.join(args.save_dir, 'best_model.pt'))
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Get predictions
+    model.eval()
+    all_targets = []
+    all_predictions = []
+    
+    with torch.no_grad():
+        for inputs, x_num, x_cat, targets in test_loader:
+            inputs = inputs.to(device)
+            x_num = x_num.to(device)
+            x_cat = x_cat.to(device)
+            targets = targets.to(device)
+            
+            predictions = model(inputs, x_num, x_cat)
+            
+            # Inverse transform
+            targets = y_scaler.inverse_transform(targets)
+            predictions = y_scaler.inverse_transform(predictions)
+            
+            all_targets.append(targets.cpu().numpy())
+            all_predictions.append(predictions.cpu().numpy())
+            
+    all_targets = np.vstack(all_targets)
+    all_predictions = np.vstack(all_predictions)
+    
+    # Save predictions to CSV for ensembling
+    results_df = pd.DataFrame({
+        'sbp_true': all_targets[:, 0],
+        'dbp_true': all_targets[:, 1],
+        'sbp_pred_transformer': all_predictions[:, 0],
+        'dbp_pred_transformer': all_predictions[:, 1]
+    })
+    results_path = os.path.join(args.save_dir, 'predictions_transformer.csv')
+    results_df.to_csv(results_path, index=False)
+    logger.info(f"Predictions saved to: {results_path}")
+    
+    # Save Test Data for GBDT (to ensure same split)
+    # We need to reconstruct the test dataframe from the loader or indices
+    # Since we didn't save indices, we can't easily reconstruct the exact features row-by-row 
+    # aligned with the original CSV unless we saved them.
+    # However, for ensembling, we just need the targets to match.
+    # But for GBDT training, we need the FEATURES of the test set.
+    
+    # Let's save the full test set (features + targets) to a CSV
+    # We need to iterate the loader again and collect features
+    logger.info("Saving test set features for GBDT benchmarking...")
+    all_features_signal = []
+    all_features_num = []
+    all_features_cat = []
+    
+    with torch.no_grad():
+        for inputs, x_num, x_cat, _ in test_loader:
+            # Inverse transform features
+            inputs = X_scaler.inverse_transform(inputs.squeeze(1))
+            x_num = num_scaler.inverse_transform(x_num)
+            
+            all_features_signal.append(inputs.cpu().numpy())
+            all_features_num.append(x_num.cpu().numpy())
+            all_features_cat.append(x_cat.cpu().numpy())
+            
+    X_signal_test = np.vstack(all_features_signal)
+    X_num_test = np.vstack(all_features_num)
+    X_cat_test = np.vstack(all_features_cat)
+    
+    # Create DataFrame
+    # Note: We need column names. We'll hardcode them based on prepare_data
+    feature_cols = ['ptt_peak_to_peak', 'ptt_peak_to_foot', 'ptt_peak_to_maxslope', 'amplitude_ratio_ra', 'systolic_duration_tsd', 'diastolic_duration_tfd', 'time_to_maxslope_t1']
+    # num_meta_cols depends on feature engineering, but we can just name them num_0, num_1...
+    # Actually, we know them: age, bmi, hr_bpm, interaction_ptt_age, interaction_ptt_bmi
+    # But let's just use generic names to be safe or try to match
+    
+    test_df = pd.DataFrame(X_signal_test, columns=feature_cols)
+    
+    # Add numerical metadata
+    # We know there are 5 numerical features usually
+    num_cols = ['age', 'bmi', 'hr_bpm', 'interaction_ptt_age', 'interaction_ptt_bmi']
+    if X_num_test.shape[1] == len(num_cols):
+        for i, col in enumerate(num_cols):
+            test_df[col] = X_num_test[:, i]
+    else:
+        for i in range(X_num_test.shape[1]):
+            test_df[f'num_{i}'] = X_num_test[:, i]
+            
+    # Add categorical
+    cat_cols = ['sex', 'position', 'approach', 'aline1', 'preop_ecg']
+    for i, col in enumerate(cat_cols):
+        test_df[col] = X_cat_test[:, i]
+        
+    # Add targets
+    test_df['sbp_reference'] = all_targets[:, 0]
+    test_df['dbp_reference'] = all_targets[:, 1]
+    
+    test_data_path = os.path.join(args.save_dir, 'test_data_split.csv')
+    test_df.to_csv(test_data_path, index=False)
+    logger.info(f"Test data split saved to: {test_data_path}")
     
     logger.info(f"\nTraining Complete! Best R² Score: {best_r2:.4f}")
     logger.info(f"Model saved to: {os.path.join(args.save_dir, 'best_model.pt')}")

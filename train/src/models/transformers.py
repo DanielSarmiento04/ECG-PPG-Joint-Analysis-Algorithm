@@ -185,6 +185,11 @@ class PhysiologicalTransformer(nn.Module):
             nn.Linear(mlp_dim, num_outputs)
         )
         
+        # Wide Component (Linear Skip Connection)
+        # Projects all numerical features directly to output
+        # This helps capture simple linear relationships (e.g. Age vs BP)
+        self.wide_linear = nn.Linear(total_numerical, num_outputs)
+        
         # Initialize weights
         self._init_weights()
         
@@ -233,7 +238,13 @@ class PhysiologicalTransformer(nn.Module):
         # Use CLS token (index 0) for prediction
         cls_token = x[:, 0]
         
-        # Final prediction
-        output = self.head(cls_token)
+        # Deep prediction
+        deep_out = self.head(cls_token)
+        
+        # Wide prediction (Linear Skip)
+        wide_out = self.wide_linear(x_all_num)
+        
+        # Final prediction = Deep + Wide
+        output = deep_out + wide_out
         
         return output
