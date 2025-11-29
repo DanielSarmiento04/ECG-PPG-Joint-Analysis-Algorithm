@@ -390,6 +390,8 @@ def main():
                        help='Early stopping patience')
     parser.add_argument('--use_amp', action='store_true',
                        help='Use automatic mixed precision training')
+    parser.add_argument('--evaluate_only', action='store_true',
+                       help='Skip training and only evaluate the best model')
     
     # Other parameters
     parser.add_argument('--save_dir', type=str, default='checkpoints',
@@ -457,6 +459,10 @@ def main():
     best_r2 = -float('inf')
     patience_counter = 0
     
+    if args.evaluate_only:
+        logger.info("Evaluation mode enabled: Skipping training loop.")
+        args.epochs = 0
+
     logger.info(f"\nStarting training for {args.epochs} epochs...")
     
     for epoch in range(args.epochs):
@@ -555,12 +561,24 @@ def main():
             break
     
     # Plot training curves
-    plot_training_curves(train_losses, test_losses, r2_scores, args.save_dir)
+    if not args.evaluate_only:
+        plot_training_curves(train_losses, test_losses, r2_scores, args.save_dir)
     
     # --- Final Evaluation & Prediction Saving ---
     logger.info("\nLoading best model for final evaluation and prediction saving...")
     checkpoint = torch.load(os.path.join(args.save_dir, 'best_model.pt'))
     model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load scaler stats from checkpoint to ensure consistency with training
+    if 'y_scaler_mean' in checkpoint:
+        y_scaler.mean = checkpoint['y_scaler_mean'].to(device)
+        y_scaler.std = checkpoint['y_scaler_std'].to(device)
+    if 'num_scaler_mean' in checkpoint:
+        num_scaler.mean = checkpoint['num_scaler_mean'].to(device)
+        num_scaler.std = checkpoint['num_scaler_std'].to(device)
+        
+    if 'best_r2' in checkpoint:
+        best_r2 = checkpoint['best_r2']
     
     # Get predictions
     model.eval()
