@@ -357,11 +357,9 @@ def main():
                        help='Batch size for training')
     
     # Model architecture
-    parser.add_argument('--patch_size', type=int, default=1,
-                       help='Size of each patch (1 for feature vectors)')
     parser.add_argument('--hidden_size', type=int, default=128,
                        help='Dimension of hidden representations')
-    parser.add_argument('--depth', type=int, default=8,
+    parser.add_argument('--depth', type=int, default=6,
                        help='Number of transformer blocks')
     parser.add_argument('--num_heads', type=int, default=8,
                        help='Number of attention heads')
@@ -419,7 +417,6 @@ def main():
         num_numerical_features = 3 # Fallback default
         
     model = PhysiologicalTransformer(
-        patch_size=args.patch_size,
         hidden_size=args.hidden_size,
         depth=args.depth,
         num_heads=args.num_heads,
