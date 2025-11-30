@@ -335,10 +335,26 @@ def prepare_data_temporal(
     final_static_cat_cols = []
     cat_cardinalities = []
     
+    # Define Top-K for high cardinality columns
+    top_k_map = {
+        'dx': 50,
+        'opname': 50
+    }
+    
     for col in cat_static_cols:
         if col in df.columns:
+            col_data = df[col].astype(str)
+            
+            # Handle High Cardinality with Top-K
+            if col in top_k_map:
+                top_k = top_k_map[col]
+                # Get top K most frequent categories
+                top_cats = col_data.value_counts().nlargest(top_k).index.tolist()
+                # Replace others with 'Other'
+                col_data = col_data.apply(lambda x: x if x in top_cats else 'Other')
+                logger.info(f"Processed {col}: Kept top {top_k} classes, mapped rest to 'Other'")
+            
             le = LabelEncoder()
-            col_data = df[col].astype(str).tolist()
             df[col + '_enc'] = le.fit_transform(col_data)
             final_static_cat_cols.append(col + '_enc')
             cat_cardinalities.append(len(le.classes_))
