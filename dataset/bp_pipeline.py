@@ -108,7 +108,7 @@ class AdaptiveRPeakDetector:
         else:
             quality_score = 0.0
             
-        return r_peaks, rr_intervals_ms, hr_bpm, quality_score
+        return r_peaks, rr_intervals_ms, hr_bpm, quality_score # type: ignore
 
 class BPEstimationPipeline:
     def __init__(self, config_path: str):
@@ -154,7 +154,7 @@ class BPEstimationPipeline:
             }
         except Exception as e:
             logger.error(f"Error loading {file_path}: {e}")
-            return None
+            return None # type: ignore
 
     def wavelet_filter(self, signal_data: np.ndarray, hr_bpm: float, signal_type: str) -> np.ndarray:
         """
