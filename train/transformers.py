@@ -33,11 +33,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 # from torchinfo import summary
 
-from src.models.transformers import PhysiologicalTransformer
+from src.models.transformers import TemporalPhysiologicalTransformer
 from src.utils.hardware import get_device
+from src.utils.losses import PhysiologicalLoss
+from src.utils.visualizations import plot_training_curves, plot_predictions
 
 from sklearn.preprocessing import LabelEncoder
 
@@ -49,25 +51,74 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class SequenceDataset(torch.utils.data.Dataset):
+    """
+    Dataset for Temporal Physiological Transformer.
+    Returns sliding windows of dynamic features and corresponding static features.
+    """
+    def __init__(self, sequences, static_cont, static_cat, targets):
+        self.sequences = sequences # List of tensors [Seq_Len, Features]
+        self.static_cont = static_cont # List of tensors [Num_Cont]
+        self.static_cat = static_cat # List of tensors [Num_Cat]
+        self.targets = targets # List of tensors [2] (SBP, DBP)
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        return self.sequences[idx], self.static_cont[idx], self.static_cat[idx], self.targets[idx]
+
+def create_sequences(df, patient_col, dynamic_cols, static_cont_cols, static_cat_cols, target_cols, seq_len=30):
+    """
+    Create sliding window sequences grouped by patient.
+    """
+    sequences = []
+    statics_cont = []
+    statics_cat = []
+    targets = []
+    
+    # Group by patient to ensure windows don't cross patient boundaries
+    # Use tqdm for progress on patients
+    patient_groups = list(df.groupby(patient_col))
+    
+    for pid, group in tqdm(patient_groups, desc="Creating sequences"):
+        # Sort by time if a timestamp exists, otherwise assume index is temporal
+        # Assuming data is already sorted by time per patient in the CSV
+        
+        data_dyn = group[dynamic_cols].values
+        data_stat_cont = group[static_cont_cols].values
+        data_stat_cat = group[static_cat_cols].values
+        data_tgt = group[target_cols].values
+        
+        if len(group) <= seq_len:
+            continue
+            
+        # Create sliding windows
+        # We can vectorize this for speed if needed, but loop is clearer
+        # Fix: Iterate to allow using the last window
+        for i in range(len(group) - seq_len + 1):
+            # Input: T steps
+            seq = data_dyn[i : i + seq_len]
+            # Static: Constant for the window (take last step)
+            stat_cont = data_stat_cont[i + seq_len - 1]
+            stat_cat = data_stat_cat[i + seq_len - 1]
+            # Target: The BP at the END of the window (Estimation, not Forecasting)
+            tgt = data_tgt[i + seq_len - 1]
+            
+            sequences.append(torch.tensor(seq, dtype=torch.float32))
+            statics_cont.append(torch.tensor(stat_cont, dtype=torch.float32))
+            statics_cat.append(torch.tensor(stat_cat, dtype=torch.long))
+            targets.append(torch.tensor(tgt, dtype=torch.float32))
+            
+    return sequences, statics_cont, statics_cat, targets
+
 def create_optimizer_and_scheduler(
     model: nn.Module, 
     args: argparse.Namespace, 
     num_training_steps: int
-) -> Tuple[AdamW, OneCycleLR]:
+) -> Tuple[AdamW, Any]:
     """
     Create optimizer with weight decay and learning rate scheduler.
-    
-    Uses AdamW optimizer with differential weight decay:
-    - Applies weight decay to weights but not to biases and LayerNorm parameters
-    - OneCycleLR scheduler for cyclical learning rate with warm-up
-    
-    Args:
-        model: Neural network model
-        args: Training arguments containing lr and weight_decay
-        num_training_steps: Total number of training steps
-        
-    Returns:
-        Tuple of (optimizer, scheduler)
     """
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -81,14 +132,13 @@ def create_optimizer_and_scheduler(
         }
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr, eps=1e-8, betas=(0.9, 0.999))
-    scheduler = OneCycleLR(
+    
+    # Use ReduceLROnPlateau as requested
+    scheduler = ReduceLROnPlateau(
         optimizer, 
-        max_lr=args.lr, 
-        total_steps=num_training_steps, 
-        pct_start=0.1,  # 10% warm-up
-        anneal_strategy='cos',
-        div_factor=25.0,  # Initial lr = max_lr/25
-        final_div_factor=1e4  # Final lr = max_lr/1e4
+        mode='min', 
+        factor=0.5, 
+        patience=3
     )
     return optimizer, scheduler
 
@@ -222,22 +272,18 @@ class TorchStandardScaler:
         x = x.to(self.device)
         return x * self.std.to(x.device) + self.mean.to(x.device)
 
-def prepare_data(
+def prepare_data_temporal(
     data_path: str, 
     device: torch.device, 
     batch_size: int, 
-    input_length: int,
-    train_split: float = 0.9,
+    seq_length: int = 30,
+    train_split: float = 0.8,
     random_seed: int = 42
-) -> Tuple[DataLoader, DataLoader, TorchStandardScaler, TorchStandardScaler, TorchStandardScaler, list]:
+) -> Tuple[DataLoader, DataLoader, DataLoader, TorchStandardScaler, TorchStandardScaler, TorchStandardScaler, int, int, list]:
     """
-    Load and prepare ECG/PPG data for training with hybrid inputs.
-    
-    Loads data from Excel/CSV file, normalizes features and targets,
-    encodes categorical variables, and creates train/test data loaders.
-    
-    Returns:
-        Tuple of (train_loader, test_loader, y_scaler, X_scaler, num_scaler, cardinalities)
+    Load and prepare ECG/PPG data for Temporal Transformer.
+    Splits data by PATIENT ID to prevent leakage.
+    Returns: Train, Val, Test loaders
     """
     logger.info(f"Loading data from {data_path}")
     
@@ -250,104 +296,142 @@ def prepare_data(
         df = pd.read_excel(data_path)
     logger.info(f"Loaded {len(df)} samples")
     
-    # --- 1. Signal Features ---
-    feature_cols = ['ptt_peak_to_peak', 'ptt_peak_to_foot', 'ptt_peak_to_maxslope', 'amplitude_ratio_ra', 'systolic_duration_tsd', 'diastolic_duration_tfd', 'time_to_maxslope_t1']
+    # Ensure patient_id exists
+    if 'patient_id' not in df.columns:
+        logger.warning("patient_id column not found! Using dummy patient IDs (High Risk of Leakage)")
+        df['patient_id'] = 0
+    
+    # --- 1. Dynamic Features (Time-Series) ---
+    dynamic_cols = ['ptt_peak_to_peak', 'ptt_peak_to_foot', 'ptt_peak_to_maxslope', 
+                    'amplitude_ratio_ra', 'systolic_duration_tsd', 'diastolic_duration_tfd', 
+                    'time_to_maxslope_t1', 'hr_bpm', 'cycle_correlation']
+    
+    # Check which exist
+    dynamic_cols = [c for c in dynamic_cols if c in df.columns]
+    
+    # --- 2. Static Features (Demographics + Categorical) ---
+    # Numerical Static
+    num_static_cols = ['age', 'bmi']
+    # Categorical Static
+    cat_static_cols = ['sex', 'position', 'approach', 'aline1', 'preop_ecg', 'dx', 'opname']
+    
     target_cols = ['sbp_reference', 'dbp_reference']
     
-    # --- 2. Numerical Metadata ---
-    # age, bmi, hr_bpm
-    num_meta_cols = ['age', 'bmi', 'hr_bpm']
+    # Fill missing
+    for c in num_static_cols:
+        if c in df.columns:
+            df[c] = df[c].fillna(df[c].mean())
+        else:
+            df[c] = 0.0
+            
+    for c in cat_static_cols:
+        if c in df.columns:
+            df[c] = df[c].fillna('Unknown')
+        else:
+            df[c] = 'Unknown'
+            
+    # Encode Categoricals
+    final_static_cont_cols = [c for c in num_static_cols if c in df.columns]
+    final_static_cat_cols = []
+    cat_cardinalities = []
     
-    # --- 3. Categorical Metadata ---
-    # sex, position, approach, aline1, preop_ecg
-    cat_meta_cols = ['sex', 'position', 'approach', 'aline1', 'preop_ecg']
-    
-    # Check columns exist
-    all_cols = feature_cols + target_cols + num_meta_cols + cat_meta_cols
-    missing_cols = [c for c in all_cols if c not in df.columns]
-    if missing_cols:
-        logger.warning(f"Missing columns: {missing_cols}. Filling with defaults.")
-        for c in missing_cols:
-            if c in num_meta_cols:
-                df[c] = 0.0
-            elif c in cat_meta_cols:
-                df[c] = 'Unknown'
-    
-    # --- Feature Engineering: Interaction Features ---
-    # PTT / Height (using BMI as proxy for body size if height not available)
-    # PTT * Age
-    if 'age' in df.columns and 'ptt_peak_to_peak' in df.columns:
-        df['interaction_ptt_age'] = df['ptt_peak_to_peak'] * df['age']
-        num_meta_cols.append('interaction_ptt_age')
-        
-    if 'bmi' in df.columns and 'ptt_peak_to_peak' in df.columns:
-        df['interaction_ptt_bmi'] = df['ptt_peak_to_peak'] / (df['bmi'] + 1e-6)
-        num_meta_cols.append('interaction_ptt_bmi')
+    for col in cat_static_cols:
+        if col in df.columns:
+            le = LabelEncoder()
+            col_data = df[col].astype(str).tolist()
+            df[col + '_enc'] = le.fit_transform(col_data)
+            final_static_cat_cols.append(col + '_enc')
+            cat_cardinalities.append(len(le.classes_))
+            logger.info(f"Encoded {col}: {len(le.classes_)} classes")
 
-    # Extract Tensors
-    X_signal = torch.tensor(df[feature_cols].values, dtype=torch.float32, device=device)
-    y = torch.tensor(df[target_cols].values, dtype=torch.float32, device=device)
-    X_num = torch.tensor(df[num_meta_cols].fillna(0).values, dtype=torch.float32, device=device)
+    # --- Patient-Wise Split ---
+    patient_ids = df['patient_id'].unique()
+    np.random.seed(random_seed)
+    np.random.shuffle(patient_ids)
     
-    # Process Categorical
-    X_cat_list = []
-    cardinalities = []
-    for col in cat_meta_cols:
-        le = LabelEncoder()
-        # Fill NaNs with 'Unknown' and convert to string
-        col_data = df[col].fillna('Unknown').astype(str).values
-        encoded = le.fit_transform(col_data)
-        X_cat_list.append(torch.tensor(encoded, dtype=torch.long, device=device).unsqueeze(1))
-        cardinalities.append(len(le.classes_))
-        logger.info(f"Categorical '{col}': {len(le.classes_)} classes")
-        
-    X_cat = torch.cat(X_cat_list, dim=1)
+    # First split: Train+Val vs Test
+    split_idx_test = int(len(patient_ids) * train_split)
+    dev_pids = patient_ids[:split_idx_test]
+    test_pids = patient_ids[split_idx_test:]
     
-    # Handle NaNs/Infs in numerical data
-    for tensor_name, tensor in [('X_signal', X_signal), ('y', y), ('X_num', X_num)]:
-        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-            logger.warning(f"Found NaN/Inf in {tensor_name}, replacing with zeros")
-            tensor.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Fit scalers
-    X_scaler = TorchStandardScaler(device).fit(X_signal)
-    y_scaler = TorchStandardScaler(device).fit(y)
-    num_scaler = TorchStandardScaler(device).fit(X_num)
+    # Second split: Train vs Val (90/10 of Dev)
+    split_idx_val = int(len(dev_pids) * 0.9)
+    train_pids = dev_pids[:split_idx_val]
+    val_pids = dev_pids[split_idx_val:]
     
-    # Normalize
-    X_signal_norm = X_scaler.transform(X_signal).unsqueeze(1)
-    y_norm = y_scaler.transform(y)
-    X_num_norm = num_scaler.transform(X_num)
+    logger.info(f"Splitting by Patient: {len(train_pids)} Train, {len(val_pids)} Val, {len(test_pids)} Test")
     
-    # Split
-    total_size = X_signal_norm.size(0)
-    train_size = int(train_split * total_size)
+    train_df = df[df['patient_id'].isin(train_pids)].copy()
+    val_df = df[df['patient_id'].isin(val_pids)].copy()
+    test_df = df[df['patient_id'].isin(test_pids)].copy()
     
-    torch.manual_seed(random_seed)
-    indices = torch.randperm(total_size, device=device)
+    # --- Normalization ---
+    # Fit scalers ONLY on Training Data
     
-    train_idx = indices[:train_size]
-    test_idx = indices[train_size:]
+    # Dynamic Features
+    X_dyn_train = torch.tensor(train_df[dynamic_cols].values, dtype=torch.float32, device=device)
+    dyn_scaler = TorchStandardScaler(device).fit(X_dyn_train)
     
-    train_dataset = TensorDataset(
-        X_signal_norm[train_idx], 
-        X_num_norm[train_idx], 
-        X_cat[train_idx], 
-        y_norm[train_idx]
+    # Static Continuous Features
+    X_stat_cont_train = torch.tensor(train_df[final_static_cont_cols].values, dtype=torch.float32, device=device)
+    stat_scaler = TorchStandardScaler(device).fit(X_stat_cont_train)
+    
+    # Targets
+    y_train = torch.tensor(train_df[target_cols].values, dtype=torch.float32, device=device)
+    y_scaler = TorchStandardScaler(device).fit(y_train)
+    
+    # Apply Normalization
+    # Transform Train
+    train_df[dynamic_cols] = dyn_scaler.transform(X_dyn_train).cpu().numpy()
+    train_df[final_static_cont_cols] = stat_scaler.transform(X_stat_cont_train).cpu().numpy()
+    train_df[target_cols] = y_scaler.transform(y_train).cpu().numpy()
+    
+    # Transform Val
+    X_dyn_val = torch.tensor(val_df[dynamic_cols].values, dtype=torch.float32, device=device)
+    X_stat_cont_val = torch.tensor(val_df[final_static_cont_cols].values, dtype=torch.float32, device=device)
+    y_val = torch.tensor(val_df[target_cols].values, dtype=torch.float32, device=device)
+    
+    val_df[dynamic_cols] = dyn_scaler.transform(X_dyn_val).cpu().numpy()
+    val_df[final_static_cont_cols] = stat_scaler.transform(X_stat_cont_val).cpu().numpy()
+    val_df[target_cols] = y_scaler.transform(y_val).cpu().numpy()
+    
+    # Transform Test
+    X_dyn_test = torch.tensor(test_df[dynamic_cols].values, dtype=torch.float32, device=device)
+    X_stat_cont_test = torch.tensor(test_df[final_static_cont_cols].values, dtype=torch.float32, device=device)
+    y_test = torch.tensor(test_df[target_cols].values, dtype=torch.float32, device=device)
+    
+    test_df[dynamic_cols] = dyn_scaler.transform(X_dyn_test).cpu().numpy()
+    test_df[final_static_cont_cols] = stat_scaler.transform(X_stat_cont_test).cpu().numpy()
+    test_df[target_cols] = y_scaler.transform(y_test).cpu().numpy()
+    
+    # --- Create Sequences ---
+    logger.info("Creating training sequences...")
+    train_seq, train_stat_cont, train_stat_cat, train_tgt = create_sequences(
+        train_df, 'patient_id', dynamic_cols, final_static_cont_cols, final_static_cat_cols, target_cols, seq_length
     )
-    test_dataset = TensorDataset(
-        X_signal_norm[test_idx], 
-        X_num_norm[test_idx], 
-        X_cat[test_idx], 
-        y_norm[test_idx]
+    
+    logger.info("Creating validation sequences...")
+    val_seq, val_stat_cont, val_stat_cat, val_tgt = create_sequences(
+        val_df, 'patient_id', dynamic_cols, final_static_cont_cols, final_static_cat_cols, target_cols, seq_length
     )
+    
+    logger.info("Creating testing sequences...")
+    test_seq, test_stat_cont, test_stat_cat, test_tgt = create_sequences(
+        test_df, 'patient_id', dynamic_cols, final_static_cont_cols, final_static_cat_cols, target_cols, seq_length
+    )
+    
+    # Create Datasets
+    train_dataset = SequenceDataset(train_seq, train_stat_cont, train_stat_cat, train_tgt)
+    val_dataset = SequenceDataset(val_seq, val_stat_cont, val_stat_cat, val_tgt)
+    test_dataset = SequenceDataset(test_seq, test_stat_cont, test_stat_cat, test_tgt)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    logger.info(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
+    logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
     
-    return train_loader, test_loader, y_scaler, X_scaler, num_scaler, cardinalities
+    return train_loader, val_loader, test_loader, y_scaler, dyn_scaler, stat_scaler, len(dynamic_cols), len(final_static_cont_cols), cat_cardinalities
 
 def evaluate_model(
     model: nn.Module, 
@@ -365,16 +449,16 @@ def evaluate_model(
     all_predictions = []
     
     with torch.no_grad():
-        for inputs, x_num, x_cat, targets in test_loader:
+        for inputs, x_static_cont, x_static_cat, targets in test_loader:
             inputs = inputs.to(device)
-            x_num = x_num.to(device)
-            x_cat = x_cat.to(device)
+            x_static_cont = x_static_cont.to(device)
+            x_static_cat = x_static_cat.to(device)
             targets = targets.to(device)
             
-            predictions = model(inputs, x_num, x_cat)
+            predictions = model(inputs, x_static_cont, x_static_cat)
             
-            # Pass y_scaler to criterion if it's WeightedMSELoss
-            if isinstance(criterion, WeightedMSELoss):
+            # Pass y_scaler to criterion if it's WeightedMSELoss or PhysiologicalLoss
+            if isinstance(criterion, (WeightedMSELoss, PhysiologicalLoss)):
                 loss = criterion(predictions, targets, y_scaler)
             else:
                 loss = criterion(predictions, targets)
@@ -394,80 +478,77 @@ def evaluate_model(
     all_predictions = np.vstack(all_predictions)
     
     # Calculate metrics
-    # Note: MSE/Loss here is on the scaled data if y_scaler is None, or unscaled if provided
-    # But total_loss above is always on scaled data (as per training objective)
-    
     rmse = np.sqrt(mean_squared_error(all_targets, all_predictions))
     mae = mean_absolute_error(all_targets, all_predictions)
     r2 = r2_score(all_targets, all_predictions)
     
-    # Per-output R² scores (useful for multi-output regression)
-    r2_per_output = r2_score(all_targets, all_predictions, multioutput='raw_values')
+    # AAMI Standard Check
+    errors = all_predictions - all_targets
+    mean_error = np.mean(errors, axis=0)
+    std_error = np.std(errors, axis=0)
+    
+    logger.info(f"AAMI Stats - SBP: ME={mean_error[0]:.2f}, STD={std_error[0]:.2f}")
+    logger.info(f"AAMI Stats - DBP: ME={mean_error[1]:.2f}, STD={std_error[1]:.2f}")
     
     return {
-        'loss': total_loss / len(test_loader), # Keep loss on scaled data for consistency
+        'loss': total_loss / len(test_loader),
         'rmse': rmse,
         'mae': mae,
-        'r2': r2,
-        'r2_output_0': r2_per_output[0],
-        'r2_output_1': r2_per_output[1] if len(r2_per_output) > 1 else 0.0
+        'r2': r2
     }
-
-
 
 def main():
     """Main training loop with advanced techniques."""
-    parser = argparse.ArgumentParser(description='Train Vision Transformer for ECG/PPG signal analysis')
+    parser = argparse.ArgumentParser(description='Train Temporal Transformer for BP Estimation')
     
     # Data parameters
     parser.add_argument('--data_path', type=str, default='src/data/bp_dataset_features.csv',
                        help='Path to the dataset file (CSV or Excel)')
-    parser.add_argument('--input_length', type=int, default=7,
-                       help='Length of input signal or number of features')
-    parser.add_argument('--batch_size', type=int, default=64,
+    parser.add_argument('--seq_length', type=int, default=30,
+                       help='Sequence length (number of beats history)')
+    parser.add_argument('--batch_size', type=int, default=128,
                        help='Batch size for training')
     
     # Model architecture
-    parser.add_argument('--hidden_size', type=int, default=256,
+    parser.add_argument('--hidden_size', type=int, default=128,
                        help='Dimension of hidden representations')
-    parser.add_argument('--depth', type=int, default=6,
+    parser.add_argument('--depth', type=int, default=4,
                        help='Number of transformer blocks')
-    parser.add_argument('--num_heads', type=int, default=8,
+    parser.add_argument('--num_heads', type=int, default=4,
                        help='Number of attention heads')
-    parser.add_argument('--mlp_dim', type=int, default=512,
-                       help='Dimension of MLP layer')
     parser.add_argument('--dropout', type=float, default=0.2,
                        help='Dropout rate')
-    parser.add_argument('--att_dropout', type=float, default=0.1,
-                       help='Attention dropout rate')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=200,
+    parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=5e-4,
+    parser.add_argument('--lr', type=float, default=1e-3,
                        help='Initial learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-3,
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
                        help='Weight decay for regularization')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                        help='Gradient clipping value (0 to disable)')
-    parser.add_argument('--patience', type=int, default=20,
+    parser.add_argument('--patience', type=int, default=10,
                        help='Early stopping patience')
     parser.add_argument('--use_amp', action='store_true',
                        help='Use automatic mixed precision training')
-    parser.add_argument('--use_film', action='store_true',
-                       help='Use FiLM layers for demographic conditioning')
-    parser.add_argument('--evaluate_only', action='store_true',
-                       help='Skip training and only evaluate the best model')
     
     # Other parameters
     parser.add_argument('--save_dir', type=str, default='checkpoints',
                        help='Directory to save model checkpoints')
+    parser.add_argument('--log_file', type=str, default='training.log',
+                       help='Path to log file')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for reproducibility')
     
     args = parser.parse_args()
     
-    # Set random seeds for reproducibility
+    # Setup logging to file
+    file_handler = logging.FileHandler(args.log_file)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    # Set random seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
@@ -475,53 +556,30 @@ def main():
     device = get_device()
     logger.info(f"Using device: {device}")
     
-    # MPS-specific reproducibility
-    if device.type == 'mps':
-        torch.mps.manual_seed(args.seed)
-    elif device.type == 'cuda':
-        torch.cuda.manual_seed_all(args.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-        torch.use_deterministic_algorithms(True, warn_only=True)
-    
     # Create checkpoint directory
     os.makedirs(args.save_dir, exist_ok=True)
     
-    # Load and prepare data
-    train_loader, test_loader, y_scaler, X_scaler, num_scaler, cardinalities = prepare_data(
-        args.data_path, device, args.batch_size, args.input_length, random_seed=args.seed
+    # Load and prepare data (Temporal)
+    train_loader, val_loader, test_loader, y_scaler, dyn_scaler, stat_scaler, num_dyn, num_stat_cont, cat_cardinalities = prepare_data_temporal(
+        args.data_path, device, args.batch_size, args.seq_length, random_seed=args.seed
     )
     
     # Initialize model
-    # Determine number of numerical features dynamically from the scaler
-    # num_scaler.mean is a tensor of shape (1, num_features)
-    if num_scaler.mean is not None:
-        num_numerical_features = num_scaler.mean.shape[1]
-    else:
-        num_numerical_features = 3 # Fallback default
-        
-    model = PhysiologicalTransformer(
-        hidden_size=args.hidden_size,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        mlp_dim=args.mlp_dim,
-        num_outputs=2,  # SBP and DBP
-        dropout=args.dropout,
-        attention_dropout=args.att_dropout,
-        input_length=args.input_length,
-        num_numerical_features=num_numerical_features, 
-        categorical_cardinalities=cardinalities,
-        use_film=args.use_film
+    model = TemporalPhysiologicalTransformer(
+        num_dynamic_features=num_dyn,
+        num_continuous_static=num_stat_cont,
+        categorical_cardinalities=cat_cardinalities,
+        d_model=args.hidden_size,
+        nhead=args.num_heads,
+        num_layers=args.depth,
+        dropout=args.dropout
     ).to(device)
     
-    # Print model summary
-    logger.info("\nModel Architecture:")
-    # summary(model, input_size=(args.batch_size, 1, args.input_length)) # Summary might fail with multiple inputs
+    logger.info(f"Model initialized with {num_dyn} dynamic, {num_stat_cont} static continuous features, and {len(cat_cardinalities)} categorical features.")
     
     # Loss function and optimizer
-    # Use Weighted MSE Loss for clinical relevance
-    criterion = WeightedMSELoss(device=device)
+    # Use PhysiologicalLoss as requested
+    criterion = PhysiologicalLoss(device=device, use_huber=True)
     optimizer, scheduler = create_optimizer_and_scheduler(model, args, len(train_loader) * args.epochs)
     
     # Mixed precision training
@@ -529,15 +587,11 @@ def main():
     
     # Training metrics tracking
     train_losses = []
-    test_losses = []
+    val_losses = []
     r2_scores = []
-    best_r2 = -float('inf')
+    best_val_loss = float('inf')
     patience_counter = 0
     
-    if args.evaluate_only:
-        logger.info("Evaluation mode enabled: Skipping training loop.")
-        args.epochs = 0
-
     logger.info(f"\nStarting training for {args.epochs} epochs...")
     
     for epoch in range(args.epochs):
@@ -546,10 +600,10 @@ def main():
         total_loss = 0.0
         
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}')
-        for inputs, x_num, x_cat, targets in pbar:
+        for inputs, x_static_cont, x_static_cat, targets in pbar:
             inputs = inputs.to(device)
-            x_num = x_num.to(device)
-            x_cat = x_cat.to(device)
+            x_static_cont = x_static_cont.to(device)
+            x_static_cat = x_static_cat.to(device)
             targets = targets.to(device)
             
             optimizer.zero_grad()
@@ -557,13 +611,11 @@ def main():
             # Forward pass with mixed precision
             if args.use_amp and scaler is not None:
                 with torch.cuda.amp.autocast():
-                    predictions = model(inputs, x_num, x_cat)
+                    predictions = model(inputs, x_static_cont, x_static_cat)
                     loss = criterion(predictions, targets, y_scaler)
                 
-                # Backward pass with gradient scaling
                 scaler.scale(loss).backward()
                 
-                # Gradient clipping
                 if args.grad_clip > 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -571,232 +623,120 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                predictions = model(inputs, x_num, x_cat)
+                predictions = model(inputs, x_static_cont, x_static_cat)
                 loss = criterion(predictions, targets, y_scaler)
                 loss.backward()
                 
-                # Gradient clipping
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 
                 optimizer.step()
             
-            scheduler.step()
-            total_loss += loss.item()
+            # Scheduler step (OneCycleLR steps per batch, but ReduceLROnPlateau steps per epoch)
+            # We switched to ReduceLROnPlateau, so we step after validation
+            # scheduler.step() 
             
-            # Update progress bar
+            total_loss += loss.item()
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
         avg_train_loss = total_loss / len(train_loader)
         
-        # Evaluation phase
-        metrics = evaluate_model(model, test_loader, criterion, device, y_scaler)
+        # Validation phase
+        logger.info("Validating...")
+        val_metrics = evaluate_model(model, val_loader, criterion, device, y_scaler)
+        
+        # Step scheduler based on validation loss
+        scheduler.step(val_metrics['loss'])
         
         # Store metrics
         train_losses.append(avg_train_loss)
-        test_losses.append(metrics['loss'])
-        r2_scores.append(metrics['r2'])
+        val_losses.append(val_metrics['loss'])
+        r2_scores.append(val_metrics['r2'])
         
         # Log metrics
         logger.info(
             f"Epoch {epoch+1}/{args.epochs} - "
             f"Train Loss: {avg_train_loss:.4f}, "
-            f"Test Loss: {metrics['loss']:.4f}, "
-            f"RMSE: {metrics['rmse']:.4f} mmHg, "
-            f"MAE: {metrics['mae']:.4f} mmHg, "
-            f"R²: {metrics['r2']:.4f}"
+            f"Val Loss: {val_metrics['loss']:.4f}, "
+            f"Val RMSE: {val_metrics['rmse']:.4f}, "
+            f"Val MAE: {val_metrics['mae']:.4f}, "
+            f"Val R²: {val_metrics['r2']:.4f}"
         )
         
-        # Save best model
-        if metrics['r2'] > best_r2:
-            best_r2 = metrics['r2']
+        # Save best model based on Validation Loss (or R2)
+        # Using Loss for early stopping as requested
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
             patience_counter = 0
             
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_r2': best_r2,
+                'best_val_loss': best_val_loss,
                 'args': vars(args),
                 'y_scaler_mean': y_scaler.mean,
                 'y_scaler_std': y_scaler.std,
-                'num_scaler_mean': num_scaler.mean,
-                'num_scaler_std': num_scaler.std,
-                'cardinalities': cardinalities
+                'dyn_scaler_mean': dyn_scaler.mean,
+                'dyn_scaler_std': dyn_scaler.std,
+                'stat_scaler_mean': stat_scaler.mean,
+                'stat_scaler_std': stat_scaler.std
             }
             torch.save(checkpoint, os.path.join(args.save_dir, 'best_model.pt'))
-            logger.info(f"  ✓ New best R² score: {best_r2:.4f} - Model saved!")
+            logger.info(f"  ✓ New best Val Loss: {best_val_loss:.4f} - Model saved!")
         else:
             patience_counter += 1
         
         # Early stopping
         if patience_counter >= args.patience:
-            logger.info(f"\nEarly stopping triggered after {epoch+1} epochs (patience: {args.patience})")
+            logger.info(f"\nEarly stopping triggered after {epoch+1} epochs")
             break
-    
-    # Plot training curves
-    if not args.evaluate_only:
-        plot_training_curves(train_losses, test_losses, r2_scores, args.save_dir)
-    
-    # --- Final Evaluation & Prediction Saving ---
-    logger.info("\nLoading best model for final evaluation and prediction saving...")
+            
+    # Final Evaluation on Test Set
+    logger.info("\nFinal Evaluation on Test Set...")
+    # Load best model
     checkpoint = torch.load(os.path.join(args.save_dir, 'best_model.pt'))
     model.load_state_dict(checkpoint['model_state_dict'])
     
-    # Load scaler stats from checkpoint to ensure consistency with training
-    if 'y_scaler_mean' in checkpoint:
-        y_scaler.mean = checkpoint['y_scaler_mean'].to(device)
-        y_scaler.std = checkpoint['y_scaler_std'].to(device)
-    if 'num_scaler_mean' in checkpoint:
-        num_scaler.mean = checkpoint['num_scaler_mean'].to(device)
-        num_scaler.std = checkpoint['num_scaler_std'].to(device)
-        
-    if 'best_r2' in checkpoint:
-        best_r2 = checkpoint['best_r2']
+    test_metrics = evaluate_model(model, test_loader, criterion, device, y_scaler)
+    logger.info(
+        f"TEST RESULTS - "
+        f"Loss: {test_metrics['loss']:.4f}, "
+        f"RMSE: {test_metrics['rmse']:.4f}, "
+        f"MAE: {test_metrics['mae']:.4f}, "
+        f"R²: {test_metrics['r2']:.4f}"
+    )
     
-    # Get predictions
+    plot_training_curves(train_losses, val_losses, r2_scores, args.save_dir)
+    
+    # Plot predictions for a subset of test data
+    # We need to get predictions first. evaluate_model doesn't return them.
+    # Let's just run a quick pass to get some predictions for plotting
     model.eval()
     all_targets = []
     all_predictions = []
-    
     with torch.no_grad():
-        for inputs, x_num, x_cat, targets in test_loader:
+        for inputs, x_static_cont, x_static_cat, targets in test_loader:
             inputs = inputs.to(device)
-            x_num = x_num.to(device)
-            x_cat = x_cat.to(device)
+            x_static_cont = x_static_cont.to(device)
+            x_static_cat = x_static_cat.to(device)
             targets = targets.to(device)
+            predictions = model(inputs, x_static_cont, x_static_cat)
             
-            predictions = model(inputs, x_num, x_cat)
-            
-            # Inverse transform
-            targets = y_scaler.inverse_transform(targets)
-            predictions = y_scaler.inverse_transform(predictions)
+            if y_scaler is not None:
+                targets = y_scaler.inverse_transform(targets)
+                predictions = y_scaler.inverse_transform(predictions)
             
             all_targets.append(targets.cpu().numpy())
             all_predictions.append(predictions.cpu().numpy())
-            
+            if len(all_targets) * args.batch_size > 200: # Just get enough for plotting
+                break
+                
     all_targets = np.vstack(all_targets)
     all_predictions = np.vstack(all_predictions)
+    plot_predictions(all_targets, all_predictions, args.save_dir)
     
-    # Save predictions to CSV for ensembling
-    results_df = pd.DataFrame({
-        'sbp_true': all_targets[:, 0],
-        'dbp_true': all_targets[:, 1],
-        'sbp_pred_transformer': all_predictions[:, 0],
-        'dbp_pred_transformer': all_predictions[:, 1]
-    })
-    results_path = os.path.join(args.save_dir, 'predictions_transformer.csv')
-    results_df.to_csv(results_path, index=False)
-    logger.info(f"Predictions saved to: {results_path}")
-    
-    # Save Test Data for GBDT (to ensure same split)
-    # We need to reconstruct the test dataframe from the loader or indices
-    # Since we didn't save indices, we can't easily reconstruct the exact features row-by-row 
-    # aligned with the original CSV unless we saved them.
-    # However, for ensembling, we just need the targets to match.
-    # But for GBDT training, we need the FEATURES of the test set.
-    
-    # Let's save the full test set (features + targets) to a CSV
-    # We need to iterate the loader again and collect features
-    logger.info("Saving test set features for GBDT benchmarking...")
-    all_features_signal = []
-    all_features_num = []
-    all_features_cat = []
-    
-    with torch.no_grad():
-        for inputs, x_num, x_cat, _ in test_loader:
-            # Inverse transform features
-            inputs = X_scaler.inverse_transform(inputs.squeeze(1))
-            x_num = num_scaler.inverse_transform(x_num)
-            
-            all_features_signal.append(inputs.cpu().numpy())
-            all_features_num.append(x_num.cpu().numpy())
-            all_features_cat.append(x_cat.cpu().numpy())
-            
-    X_signal_test = np.vstack(all_features_signal)
-    X_num_test = np.vstack(all_features_num)
-    X_cat_test = np.vstack(all_features_cat)
-    
-    # Create DataFrame
-    # Note: We need column names. We'll hardcode them based on prepare_data
-    feature_cols = ['ptt_peak_to_peak', 'ptt_peak_to_foot', 'ptt_peak_to_maxslope', 'amplitude_ratio_ra', 'systolic_duration_tsd', 'diastolic_duration_tfd', 'time_to_maxslope_t1']
-    # num_meta_cols depends on feature engineering, but we can just name them num_0, num_1...
-    # Actually, we know them: age, bmi, hr_bpm, interaction_ptt_age, interaction_ptt_bmi
-    # But let's just use generic names to be safe or try to match
-    
-    test_df = pd.DataFrame(X_signal_test, columns=feature_cols)
-    
-    # Add numerical metadata
-    # We know there are 5 numerical features usually
-    num_cols = ['age', 'bmi', 'hr_bpm', 'interaction_ptt_age', 'interaction_ptt_bmi']
-    if X_num_test.shape[1] == len(num_cols):
-        for i, col in enumerate(num_cols):
-            test_df[col] = X_num_test[:, i]
-    else:
-        for i in range(X_num_test.shape[1]):
-            test_df[f'num_{i}'] = X_num_test[:, i]
-            
-    # Add categorical
-    cat_cols = ['sex', 'position', 'approach', 'aline1', 'preop_ecg']
-    for i, col in enumerate(cat_cols):
-        test_df[col] = X_cat_test[:, i]
-        
-    # Add targets
-    test_df['sbp_reference'] = all_targets[:, 0]
-    test_df['dbp_reference'] = all_targets[:, 1]
-    
-    test_data_path = os.path.join(args.save_dir, 'test_data_split.csv')
-    test_df.to_csv(test_data_path, index=False)
-    logger.info(f"Test data split saved to: {test_data_path}")
-    
-    logger.info(f"\nTraining Complete! Best R² Score: {best_r2:.4f}")
-    logger.info(f"Model saved to: {os.path.join(args.save_dir, 'best_model.pt')}")
-
-
-def plot_training_curves(
-    train_losses: list,
-    test_losses: list,
-    r2_scores: list,
-    save_dir: str
-):
-    """
-    Plot and save training curves.
-    
-    Args:
-        train_losses: List of training losses
-        test_losses: List of test losses
-        r2_scores: List of R² scores
-        save_dir: Directory to save plots
-    """
-    epochs = range(1, len(train_losses) + 1)
-    
-    # Loss plot
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs, train_losses, label='Train Loss', marker='o', markersize=3, linewidth=2)
-    plt.plot(epochs, test_losses, label='Test Loss', marker='s', markersize=3, linewidth=2)
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('MSE Loss', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.title('Loss Evolution', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3)
-    
-    # R² plot
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs, r2_scores, label='R² Score', marker='d', markersize=3, 
-             linewidth=2, color='green')
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('R² Score', fontsize=12)
-    plt.legend(fontsize=10)
-    plt.title('R² Score Evolution', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'training_curves.png'), dpi=300, bbox_inches='tight')
-    logger.info(f"Training curves saved to: {os.path.join(save_dir, 'training_curves.png')}")
-    plt.show()
+    logger.info(f"Training Complete! Best Val Loss: {best_val_loss:.4f}")
 
 if __name__ == '__main__':
     main()
