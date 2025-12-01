@@ -30,8 +30,8 @@ segmentation:
 
 # Stage 5: Feature Extraction
 features:
-  ptt_min_ms: 100
-  ptt_max_ms: 500
+  ptt_min_ms: 10    # Very permissive - let model learn from data
+  ptt_max_ms: 800   # Wide range for varied physiology
   normalize_ppg: true
 
 # Quality Control

@@ -302,9 +302,24 @@ def prepare_data_temporal(
         df['patient_id'] = 0
     
     # --- 1. Dynamic Features (Time-Series) ---
-    dynamic_cols = ['ptt_peak_to_peak', 'ptt_peak_to_foot', 'ptt_peak_to_maxslope', 
-                    'amplitude_ratio_ra', 'systolic_duration_tsd', 'diastolic_duration_tfd', 
-                    'time_to_maxslope_t1', 'hr_bpm', 'cycle_correlation']
+    # NEW: Include true ECG-PPG PTT (PAT) and per-patient normalized features
+    dynamic_cols = [
+        # True ECG-PPG PTT (Pulse Arrival Time) - physiologically meaningful
+        'pat_ecg_ppg', 'pat_to_peak', 'pat_to_maxslope',
+        # Per-patient normalized PAT (removes inter-individual variability)
+        'pat_ecg_ppg_norm', 'pat_ecg_ppg_delta',
+        # Legacy PTT features
+        'ptt_peak_to_peak', 'ptt_peak_to_foot', 'ptt_peak_to_maxslope', 
+        # Morphology features
+        'amplitude_ratio_ra', 'systolic_duration_tsd', 'diastolic_duration_tfd', 
+        'time_to_maxslope_t1', 
+        # Normalized morphology
+        'amplitude_ratio_ra_norm', 'hr_bpm_norm',
+        # Heart rate and quality
+        'hr_bpm', 'cycle_correlation',
+        # Additional waveform features
+        'max_upslope', 'reflection_index', 'systolic_area_ratio'
+    ]
     
     # Check which exist
     dynamic_cols = [c for c in dynamic_cols if c in df.columns]
@@ -525,23 +540,23 @@ def main():
     parser.add_argument('--batch_size', type=int, default=128,
                        help='Batch size for training')
     
-    # Model architecture
-    parser.add_argument('--hidden_size', type=int, default=128,
-                       help='Dimension of hidden representations')
-    parser.add_argument('--depth', type=int, default=4,
-                       help='Number of transformer blocks')
+    # Model architecture (reduced complexity to prevent overfitting)
+    parser.add_argument('--hidden_size', type=int, default=64,
+                       help='Dimension of hidden representations (reduced)')
+    parser.add_argument('--depth', type=int, default=1,
+                       help='Number of transformer blocks (reduced)')
     parser.add_argument('--num_heads', type=int, default=4,
                        help='Number of attention heads')
-    parser.add_argument('--dropout', type=float, default=0.2,
-                       help='Dropout rate')
+    parser.add_argument('--dropout', type=float, default=0.5,
+                       help='Dropout rate (increased for regularization)')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                       help='Initial learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-4,
-                       help='Weight decay for regularization')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Initial learning rate (reduced to prevent overfitting)')
+    parser.add_argument('--weight_decay', type=float, default=1e-2,
+                       help='Weight decay for regularization (increased)')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                        help='Gradient clipping value (0 to disable)')
     parser.add_argument('--patience', type=int, default=10,
