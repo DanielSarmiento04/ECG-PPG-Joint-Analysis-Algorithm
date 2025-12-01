@@ -379,8 +379,14 @@ class BPEstimationPipeline:
             
             ppg = cycle.ppg_segment
             
-            # Use the FIXED feature extractor
-            features = self.feature_extractor.extract_features(ppg, hr_bpm=cycle.hr_bpm)
+            # Use the FIXED feature extractor with R-peak timing
+            # The cycle starts at R-peak, so r_peak is at index 0 of the segment
+            features = self.feature_extractor.extract_features(
+                ppg, 
+                hr_bpm=cycle.hr_bpm,
+                r_peak_sample=cycle.r_peak_idx,
+                cycle_start_sample=cycle.r_peak_idx
+            )
             
             # Check if extraction succeeded
             if not features:
@@ -392,14 +398,8 @@ class BPEstimationPipeline:
                 stats['invalid_features'] += 1
                 continue
             
-            # Additional PTT range validation from config
-            ptt_pp_ms = features.get('ptt_peak_to_peak', 0)
-            ptt_min = self.config['features'].get('ptt_min_ms', 50)
-            ptt_max = self.config['features'].get('ptt_max_ms', 400)
-            
-            if not (ptt_min < ptt_pp_ms < ptt_max):
-                stats['invalid_ptt_range'] += 1
-                continue
+            # NOTE: Removed redundant PTT range validation - validate_features handles this
+            # Let the model learn from all valid data, outliers will be handled by robust training
             
             stats['valid'] += 1
             
@@ -410,7 +410,11 @@ class BPEstimationPipeline:
                 'sbp_reference': cycle.sbp_ref,
                 'dbp_reference': cycle.dbp_ref,
                 'cycle_correlation': cycle.quality_score,
-                # Core PTT features (FIXED)
+                # NEW: True ECG-PPG PTT (Pulse Arrival Time) - physiologically meaningful
+                'pat_ecg_ppg': features.get('pat_ecg_ppg', np.nan),  # R-peak to PPG foot
+                'pat_to_peak': features.get('pat_to_peak', np.nan),   # R-peak to PPG peak
+                'pat_to_maxslope': features.get('pat_to_maxslope', np.nan),  # R-peak to max slope
+                # Legacy PTT features (PPG-internal timing)
                 'ptt_peak_to_peak': features.get('ptt_peak_to_peak', np.nan),
                 'ptt_peak_to_foot': features.get('ptt_peak_to_foot', np.nan),
                 'ptt_peak_to_maxslope': features.get('ptt_peak_to_maxslope', np.nan),

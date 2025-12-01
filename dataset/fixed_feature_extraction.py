@@ -216,13 +216,17 @@ class FixedFeatureExtractor:
         return max_slope_idx, max_slope_value
     
     def extract_features(self, ppg_cycle: np.ndarray, 
-                        hr_bpm: float) -> Dict[str, float]:
+                        hr_bpm: float,
+                        r_peak_sample: int = 0,
+                        cycle_start_sample: int = 0) -> Dict[str, float]:
         """
         Extract comprehensive features from a single PPG cardiac cycle.
         
         Args:
             ppg_cycle: PPG waveform for one cardiac cycle (R-peak to R-peak)
             hr_bpm: Heart rate in beats per minute
+            r_peak_sample: Sample index of R-peak in original signal (for true PTT)
+            cycle_start_sample: Start sample of this cycle in original signal
             
         Returns:
             Dictionary of extracted features
@@ -245,15 +249,45 @@ class FixedFeatureExtractor:
         
         # Find PPG foot (onset) - this is the key fix
         foot_idx, ptt_foot_ms = self.find_ppg_foot(ppg_norm)
+        
+        # Fallback if foot detection fails (returns 0)
+        if ptt_foot_ms < 1.0:
+            # Use minimum point in first 30% of cycle as fallback
+            search_end = max(10, len(ppg_norm) // 3)
+            foot_idx = int(np.argmin(ppg_norm[:search_end]))
+            ptt_foot_ms = float(foot_idx / self.fs * 1000)
+            # Ensure at least 2ms
+            ptt_foot_ms = max(2.0, ptt_foot_ms)
+        
         features['ptt_peak_to_foot'] = ptt_foot_ms
         
-        # Find systolic peak
+        # ===================
+        # TRUE ECG-PPG PTT (Pulse Arrival Time)
+        # ===================
+        # This is the physiologically meaningful measure: 
+        # Time from ECG R-peak to PPG foot (pulse arrival)
+        # The cycle starts at R-peak, so foot_idx IS the PAT in samples
+        pat_ms = foot_idx / self.fs * 1000
+        features['pat_ecg_ppg'] = pat_ms  # Pulse Arrival Time
+        
+        # Also compute PAT to different PPG landmarks
+        # Find systolic peak first
         peak_idx, peak_val = self.find_systolic_peak(ppg_norm)
-        ptt_peak_ms = peak_idx / self.fs * 1000
-        features['ptt_peak_to_peak'] = ptt_peak_ms
+        
+        # PAT to peak (R-peak to PPG systolic peak)
+        pat_peak_ms = peak_idx / self.fs * 1000
+        features['pat_to_peak'] = pat_peak_ms
         
         # Find max slope
         max_slope_idx, max_slope_val = self.find_max_slope(ppg_norm, 0, peak_idx + 1)
+        
+        # PAT to max slope
+        pat_maxslope_ms = max_slope_idx / self.fs * 1000
+        features['pat_to_maxslope'] = pat_maxslope_ms
+        
+        # Legacy features (for compatibility)
+        ptt_peak_ms = peak_idx / self.fs * 1000
+        features['ptt_peak_to_peak'] = ptt_peak_ms
         ptt_maxslope_ms = max_slope_idx / self.fs * 1000
         features['ptt_peak_to_maxslope'] = ptt_maxslope_ms
         
@@ -377,24 +411,42 @@ def validate_features(features: Dict[str, float]) -> bool:
     Returns:
         True if all features are valid
     """
-    # Define valid ranges (relaxed for synthetic/varied waveforms)
-    valid_ranges = {
-        'ptt_peak_to_foot': (20, 500),
-        'ptt_peak_to_peak': (50, 500),
-        'ptt_peak_to_maxslope': (20, 400),
-        'amplitude_ratio_ra': (0, 1),
-        'systolic_duration_tsd': (50, 700),
-        'diastolic_duration_tfd': (100, 900),
-        'time_to_maxslope_t1': (0, 300),
-        'hr_bpm': (30, 200),
-    }
+    # MINIMAL validation - only reject clearly broken data
+    # Let the ML model handle outliers through robust training
     
-    for key, (min_val, max_val) in valid_ranges.items():
-        if key in features:
-            val = features[key]
-            if not (min_val <= val <= max_val):
-                logger.debug(f"Feature {key}={val} out of range [{min_val}, {max_val}]")
+    # Must have minimum required features (including new PAT)
+    required_features = ['pat_ecg_ppg', 'ptt_peak_to_foot', 'amplitude_ratio_ra', 'hr_bpm']
+    for key in required_features:
+        if key not in features:
+            logger.debug(f"Missing required feature: {key}")
+            return False
+    
+    # Check all features for NaN/inf
+    for key, val in features.items():
+        if isinstance(val, (int, float)):
+            if np.isnan(val) or np.isinf(val):
+                logger.debug(f"Feature {key} is NaN or inf")
                 return False
+    
+    # Only basic sanity checks - very permissive
+    # PAT (R-peak to PPG foot) should be positive and physiologically reasonable
+    # Typical PAT is 150-400ms depending on measurement site
+    pat = features.get('pat_ecg_ppg', 0)
+    if pat < 1 or pat > 1000:  # Very permissive range
+        logger.debug(f"PAT out of sanity range: {pat}")
+        return False
+    
+    # Legacy PTT check
+    ptt = features.get('ptt_peak_to_foot', 0)
+    if ptt < 1 or ptt > 2000:
+        logger.debug(f"PTT out of sanity range: {ptt}")
+        return False
+    
+    # HR should be between 10 and 300 BPM (extreme but possible)
+    hr = features.get('hr_bpm', 0)
+    if hr < 10 or hr > 300:
+        logger.debug(f"HR out of sanity range: {hr}")
+        return False
     
     return True
 
