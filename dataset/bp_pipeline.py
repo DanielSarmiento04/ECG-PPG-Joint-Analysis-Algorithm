@@ -436,6 +436,14 @@ class BPEstimationPipeline:
                 'pulse_width_50': features.get('pulse_width_50', np.nan),
                 'crest_time': features.get('crest_time', np.nan),
                 'reflection_index': features.get('reflection_index', np.nan),
+                # NEW: Statistical features (Robust Fallback)
+                'stat_mean': features.get('stat_mean', np.nan),
+                'stat_std': features.get('stat_std', np.nan),
+                'stat_skew': features.get('stat_skew', np.nan),
+                'stat_kurtosis': features.get('stat_kurtosis', np.nan),
+                'stat_power_cardiac': features.get('stat_power_cardiac', np.nan),
+                'stat_power_low': features.get('stat_power_low', np.nan),
+                'stat_power_ratio': features.get('stat_power_ratio', np.nan),
             }
             
             features_list.append(feature_record)

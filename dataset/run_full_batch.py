@@ -37,7 +37,15 @@ def add_per_patient_normalized_features(df: pd.DataFrame) -> pd.DataFrame:
         'hr_bpm',
         'max_upslope',
         'reflection_index',
-        'systolic_area_ratio'
+        'systolic_area_ratio',
+        # NEW: Statistical features
+        'stat_mean',
+        'stat_std',
+        'stat_skew',
+        'stat_kurtosis',
+        'stat_power_cardiac',
+        'stat_power_low',
+        'stat_power_ratio'
     ]
     
     for feat in features_to_normalize:

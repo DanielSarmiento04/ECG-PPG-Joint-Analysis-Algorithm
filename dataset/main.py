@@ -277,7 +277,7 @@ def main():
     
     # Configuration
     MIN_DURATION_MIN = 30  # Minimum case duration in minutes
-    MAX_CASES_TO_DOWNLOAD = None  # Set to None to download all available cases
+    MAX_CASES_TO_DOWNLOAD = 50  # Set to None to download all available cases
     USE_ENHANCED_PARAMS = False  # Set True to include hemodynamic parameters
     
     print("=" * 80)

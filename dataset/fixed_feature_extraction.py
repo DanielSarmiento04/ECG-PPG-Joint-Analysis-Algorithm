@@ -14,6 +14,7 @@ Key Fixes:
 
 import numpy as np
 from scipy import signal as sig
+from scipy.stats import skew, kurtosis
 from scipy.ndimage import gaussian_filter1d
 from typing import Dict, Tuple, Optional
 import logging
@@ -117,13 +118,18 @@ class FixedFeatureExtractor:
             ppg_norm = (ppg_segment - ppg_min) / (ppg_max - ppg_min)
         else:
             return 0, 0.0
+            
+        # CONSTRAINT: Systolic peak typically occurs in the first 600ms or 70% of cycle
+        # This prevents detecting the end of the cycle as a peak (baseline drift)
+        max_search_samples = int(min(len(ppg_norm) * 0.7, 0.6 * self.fs))
+        search_region = ppg_norm[:max_search_samples]
         
-        # Find peaks
-        peaks, properties = sig.find_peaks(ppg_norm, prominence=min_prominence)
+        # Find peaks in the constrained region
+        peaks, properties = sig.find_peaks(search_region, prominence=min_prominence)
         
         if len(peaks) == 0:
-            # Fallback: use argmax
-            peak_idx = int(np.argmax(ppg_norm))
+            # Fallback: use argmax in the constrained region
+            peak_idx = int(np.argmax(search_region))
             return peak_idx, float(ppg_norm[peak_idx])
         
         # Take the most prominent peak (usually systolic)
@@ -247,13 +253,24 @@ class FixedFeatureExtractor:
         # 1. PTT Features (FIXED)
         # ===================
         
+        # Find systolic peak first (needed for foot search constraint)
+        peak_idx, peak_val = self.find_systolic_peak(ppg_norm)
+        
         # Find PPG foot (onset) - this is the key fix
-        foot_idx, ptt_foot_ms = self.find_ppg_foot(ppg_norm)
+        # Constraint: Foot must be BEFORE the peak
+        # We pass the peak_idx as a hint or constraint if possible, 
+        # but find_ppg_foot currently takes max_search_ms.
+        # Let's limit max_search_ms to the peak time.
+        peak_time_ms = peak_idx / self.fs * 1000
+        foot_search_window = min(400, peak_time_ms) if peak_time_ms > 50 else 400
+        
+        foot_idx, ptt_foot_ms = self.find_ppg_foot(ppg_norm, max_search_ms=foot_search_window)
         
         # Fallback if foot detection fails (returns 0)
         if ptt_foot_ms < 1.0:
-            # Use minimum point in first 30% of cycle as fallback
-            search_end = max(10, len(ppg_norm) // 3)
+            # Use minimum point in first 40% of cycle as fallback (increased from 30%)
+            # BUT ensure it is before the peak
+            search_end = max(10, min(int(len(ppg_norm) * 0.4), peak_idx))
             foot_idx = int(np.argmin(ppg_norm[:search_end]))
             ptt_foot_ms = float(foot_idx / self.fs * 1000)
             # Ensure at least 2ms
@@ -269,10 +286,6 @@ class FixedFeatureExtractor:
         # The cycle starts at R-peak, so foot_idx IS the PAT in samples
         pat_ms = foot_idx / self.fs * 1000
         features['pat_ecg_ppg'] = pat_ms  # Pulse Arrival Time
-        
-        # Also compute PAT to different PPG landmarks
-        # Find systolic peak first
-        peak_idx, peak_val = self.find_systolic_peak(ppg_norm)
         
         # PAT to peak (R-peak to PPG systolic peak)
         pat_peak_ms = peak_idx / self.fs * 1000
@@ -397,6 +410,38 @@ class FixedFeatureExtractor:
                 features['reflection_index'] = 0
         else:
             features['reflection_index'] = 0
+            
+        # ===================
+        # 4. Statistical Features (Robust Fallback)
+        # ===================
+        # Added from old pipeline for robustness against noise
+        features['stat_mean'] = float(np.mean(ppg_cycle))
+        features['stat_std'] = float(np.std(ppg_cycle))
+        features['stat_skew'] = float(skew(ppg_cycle))
+        features['stat_kurtosis'] = float(kurtosis(ppg_cycle))
+        
+        # Frequency domain features
+        if len(ppg_cycle) > 10:
+            try:
+                freqs, psd = sig.welch(ppg_cycle, fs=self.fs, nperseg=min(len(ppg_cycle), 256))
+                # Cardiac band (0.5-4 Hz) vs Respiratory/Low freq (<0.5 Hz)
+                idx_cardiac = np.logical_and(freqs >= 0.5, freqs <= 4.0)
+                idx_low = np.logical_and(freqs >= 0.0, freqs < 0.5)
+                
+                power_cardiac = np.sum(psd[idx_cardiac])
+                power_low = np.sum(psd[idx_low])
+                
+                features['stat_power_cardiac'] = float(power_cardiac)
+                features['stat_power_low'] = float(power_low)
+                features['stat_power_ratio'] = float(power_cardiac / (power_low + 1e-9))
+            except Exception:
+                features['stat_power_cardiac'] = 0.0
+                features['stat_power_low'] = 0.0
+                features['stat_power_ratio'] = 0.0
+        else:
+            features['stat_power_cardiac'] = 0.0
+            features['stat_power_low'] = 0.0
+            features['stat_power_ratio'] = 0.0
         
         return features
 
@@ -415,7 +460,7 @@ def validate_features(features: Dict[str, float]) -> bool:
     # Let the ML model handle outliers through robust training
     
     # Must have minimum required features (including new PAT)
-    required_features = ['pat_ecg_ppg', 'ptt_peak_to_foot', 'amplitude_ratio_ra', 'hr_bpm']
+    required_features = ['pat_ecg_ppg', 'ptt_peak_to_foot', 'amplitude_ratio_ra', 'hr_bpm', 'stat_mean', 'stat_std']
     for key in required_features:
         if key not in features:
             logger.debug(f"Missing required feature: {key}")
