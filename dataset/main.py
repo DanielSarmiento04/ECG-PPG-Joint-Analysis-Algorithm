@@ -152,7 +152,7 @@ class VitalDBDownloader:
         try:
             # Load waveforms at 500 Hz (interval = 1/500 = 0.002 seconds)
             logger.info(f"Loading waveform data at 500 Hz...")
-            waveform_vals = vitaldb.load_case(caseid, self.waveform_tracks, 1/500)
+            waveform_vals = vitaldb.load_case(caseid, self.waveform_tracks, 1/500)  # type: ignore
             
             waveform_data = {}
             if waveform_vals is not None and len(waveform_vals) > 0:
@@ -167,7 +167,7 @@ class VitalDBDownloader:
             tracks_to_load = self.numeric_tracks + (self.enhanced_tracks if use_enhanced else [])
             params_to_label = self.numeric_params + (self.enhanced_params if use_enhanced else [])
             
-            numeric_vals = vitaldb.load_case(caseid, tracks_to_load, 2)
+            numeric_vals = vitaldb.load_case(caseid, tracks_to_load, 2)  # type: ignore
             
             numeric_data = {}
             if numeric_vals is not None and len(numeric_vals) > 0:
@@ -207,7 +207,7 @@ class VitalDBDownloader:
             for key, val in numeric_data.items():
                 save_dict[f'num_{key.replace("/", "_")}'] = val
             
-            np.savez_compressed(output_file, **save_dict)
+            np.savez_compressed(output_file, **save_dict)  # type: ignore
             logger.info(f"Saved case {caseid} to {output_file}")
             
             return data_package
@@ -277,7 +277,7 @@ def main():
     
     # Configuration
     MIN_DURATION_MIN = 30  # Minimum case duration in minutes
-    MAX_CASES_TO_DOWNLOAD = 50  # Set to None to download all available cases
+    MAX_CASES_TO_DOWNLOAD = None  # Set to None to download all available cases
     USE_ENHANCED_PARAMS = False  # Set True to include hemodynamic parameters
     
     print("=" * 80)

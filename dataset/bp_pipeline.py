@@ -10,6 +10,9 @@ from typing import Dict, List, Tuple, Optional, Union
 import joblib
 from dataclasses import dataclass
 
+# Import fixed feature extraction (addresses bugs identified in forensic analysis)
+from fixed_feature_extraction import FixedFeatureExtractor, validate_features
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -118,6 +121,9 @@ class BPEstimationPipeline:
         self.fs = self.config.get('sampling_rate', 500)
         self.rpeak_detector = AdaptiveRPeakDetector(self.config['rpeak'])
         self.wavelet_params = self.config['wavelet']
+        
+        # Initialize the FIXED feature extractor (addresses forensic analysis bugs)
+        self.feature_extractor = FixedFeatureExtractor(fs=self.fs)
         
     def load_vitaldb_case(self, file_path: str) -> Dict:
         """Load a single .npz case file from VitalDB format."""
@@ -341,125 +347,103 @@ class BPEstimationPipeline:
 
     def extract_features_batch(self, cycles: List[ProcessedCycle]) -> pd.DataFrame:
         """
-        Extract 7 core parameters from synchronized cycles.
+        Extract comprehensive features from synchronized cycles using FIXED extraction.
+        
+        This method uses the FixedFeatureExtractor which addresses the bugs identified
+        in the forensic analysis:
+        - ptt_peak_to_foot: Was 93.4% zeros due to argmin bug (now uses intersecting tangent)
+        - amplitude_ratio_ra: Was 78.1% near-zero due to notch detection failure (now uses 2nd derivative)
+        - time_to_maxslope_t1: Many zeros due to incorrect calculation
+        
+        Additionally extracts new predictive features:
+        - max_upslope, max_downslope, slope_ratio
+        - max_acceleration, min_acceleration  
+        - systolic_area_ratio
+        - pulse_width_50, crest_time, reflection_index
         """
-        logger.info(f"Extracting features from {len(cycles)} cycles...")
+        logger.info(f"Extracting features from {len(cycles)} cycles using FIXED extractor...")
         features_list = []
+        
+        # Statistics tracking
+        stats = {
+            'total': len(cycles),
+            'valid': 0,
+            'invalid_flat': 0,
+            'invalid_features': 0,
+            'invalid_ptt_range': 0
+        }
         
         for i, cycle in enumerate(cycles):
             if i % 5000 == 0 and i > 0:
-                logger.info(f"Processed {i}/{len(cycles)} cycles...")
+                logger.info(f"Processed {i}/{len(cycles)} cycles... Valid: {stats['valid']}")
+            
             ppg = cycle.ppg_segment
-            ecg = cycle.ecg_segment # Starts at R-peak
             
-            # Normalize PPG [0, 1]
-            if self.config['features']['normalize_ppg']:
-                ppg_min = np.min(ppg)
-                ppg_max = np.max(ppg)
-                if ppg_max - ppg_min > 1e-6:
-                    ppg_norm = (ppg - ppg_min) / (ppg_max - ppg_min)
-                else:
-                    ppg_norm = ppg # Flat signal
-            else:
-                ppg_norm = ppg
-                
-            # --- Feature Extraction ---
+            # Use the FIXED feature extractor
+            features = self.feature_extractor.extract_features(ppg, hr_bpm=cycle.hr_bpm)
             
-            # 1. PTT Peak-to-Peak (PTT_PP)
-            # Find PPG peak
-            # We expect the systolic peak in the first half usually, but let's search the whole cycle
-            peaks, props = signal.find_peaks(ppg_norm, prominence=0.1)
-            
-            if len(peaks) == 0:
-                continue # Skip if no peak found
-                
-            # Take the most prominent peak or the first major one
-            # Usually the first peak is the systolic peak
-            ppg_peak_idx = peaks[np.argmax(props['prominences'])]
-            
-            ptt_pp_ms = ppg_peak_idx / self.fs * 1000
-            
-            # 2. PTT Peak-to-Foot (PTT_PF)
-            # Foot is min before peak. Since our window starts at R-peak, 
-            # the foot might be at index 0 or slightly after.
-            # Let's look for minimum in [0, ppg_peak_idx]
-            foot_slice = ppg_norm[:ppg_peak_idx]
-            if len(foot_slice) > 0:
-                ppg_foot_idx = np.argmin(foot_slice)
-                ptt_pf_ms = ppg_foot_idx / self.fs * 1000
-            else:
-                ppg_foot_idx = 0
-                ptt_pf_ms = 0
-                
-            # 3. PTT Peak-to-MaxSlope (PTT_PMS)
-            # Max slope in the rising edge (before peak)
-            diff_ppg = np.diff(ppg_norm)
-            # Search max slope before peak
-            slope_search_slice = diff_ppg[:ppg_peak_idx]
-            if len(slope_search_slice) > 0:
-                max_slope_idx = np.argmax(slope_search_slice)
-                ptt_pms_ms = max_slope_idx / self.fs * 1000
-                
-                # T1: Time to Max Slope from Foot
-                t1_ms = (max_slope_idx - ppg_foot_idx) / self.fs * 1000
-            else:
-                max_slope_idx = 0
-                ptt_pms_ms = 0
-                t1_ms = 0
-                
-            # --- Morphology Features ---
-            
-            # 4. Amplitude Ratio (Ra)
-            # Need Dicrotic Notch. Local minimum after systolic peak.
-            # Search from peak to end
-            post_peak_slice = ppg_norm[ppg_peak_idx:]
-            # We look for a valley (local min) followed by a small peak (dicrotic wave)
-            # Or just the first local minimum after peak
-            valleys, _ = signal.find_peaks(-post_peak_slice)
-            
-            if len(valleys) > 0:
-                notch_idx_rel = valleys[0]
-                notch_idx = ppg_peak_idx + notch_idx_rel
-                
-                ppg_peak_val = ppg_norm[ppg_peak_idx]
-                ppg_foot_val = ppg_norm[ppg_foot_idx]
-                ppg_notch_val = ppg_norm[notch_idx]
-                
-                ra = (ppg_peak_val - ppg_notch_val) / (ppg_peak_val - ppg_foot_val + 1e-6)
-                
-                # 5. Systolic Duration (Tsd)
-                tsd_ms = (notch_idx - ppg_foot_idx) / self.fs * 1000
-                
-                # 6. Diastolic Duration (Tfd)
-                # End of cycle is len(ppg)
-                tfd_ms = (len(ppg_norm) - notch_idx) / self.fs * 1000
-                
-            else:
-                # Fallback if no notch detected
-                ra = np.nan
-                tsd_ms = np.nan
-                tfd_ms = np.nan
-                
-            # Validate PTT
-            if not (self.config['features']['ptt_min_ms'] < ptt_pp_ms < self.config['features']['ptt_max_ms']):
+            # Check if extraction succeeded
+            if not features:
+                stats['invalid_flat'] += 1
                 continue
-                
-            features_list.append({
+            
+            # Validate features are within physiological bounds
+            if not validate_features(features):
+                stats['invalid_features'] += 1
+                continue
+            
+            # Additional PTT range validation from config
+            ptt_pp_ms = features.get('ptt_peak_to_peak', 0)
+            ptt_min = self.config['features'].get('ptt_min_ms', 50)
+            ptt_max = self.config['features'].get('ptt_max_ms', 400)
+            
+            if not (ptt_min < ptt_pp_ms < ptt_max):
+                stats['invalid_ptt_range'] += 1
+                continue
+            
+            stats['valid'] += 1
+            
+            # Build feature record with cycle metadata
+            feature_record = {
                 'cycle_index': cycle.cycle_index,
                 'timestamp': cycle.timestamp,
                 'sbp_reference': cycle.sbp_ref,
                 'dbp_reference': cycle.dbp_ref,
-                'ptt_peak_to_peak': ptt_pp_ms,
-                'ptt_peak_to_foot': ptt_pf_ms,
-                'ptt_peak_to_maxslope': ptt_pms_ms,
-                'amplitude_ratio_ra': ra,
-                'systolic_duration_tsd': tsd_ms,
-                'diastolic_duration_tfd': tfd_ms,
-                'time_to_maxslope_t1': t1_ms,
-                'hr_bpm': cycle.hr_bpm,
-                'cycle_correlation': cycle.quality_score
-            })
+                'cycle_correlation': cycle.quality_score,
+                # Core PTT features (FIXED)
+                'ptt_peak_to_peak': features.get('ptt_peak_to_peak', np.nan),
+                'ptt_peak_to_foot': features.get('ptt_peak_to_foot', np.nan),
+                'ptt_peak_to_maxslope': features.get('ptt_peak_to_maxslope', np.nan),
+                'time_to_maxslope_t1': features.get('time_to_maxslope_t1', np.nan),
+                # Core morphology features (FIXED)
+                'amplitude_ratio_ra': features.get('amplitude_ratio_ra', np.nan),
+                'systolic_duration_tsd': features.get('systolic_duration_tsd', np.nan),
+                'diastolic_duration_tfd': features.get('diastolic_duration_tfd', np.nan),
+                # Heart rate
+                'hr_bpm': features.get('hr_bpm', cycle.hr_bpm),
+                # NEW: Derivative features
+                'max_upslope': features.get('max_upslope', np.nan),
+                'max_downslope': features.get('max_downslope', np.nan),
+                'slope_ratio': features.get('slope_ratio', np.nan),
+                'max_acceleration': features.get('max_acceleration', np.nan),
+                'min_acceleration': features.get('min_acceleration', np.nan),
+                # NEW: Waveform features
+                'systolic_area_ratio': features.get('systolic_area_ratio', np.nan),
+                'pulse_width_50': features.get('pulse_width_50', np.nan),
+                'crest_time': features.get('crest_time', np.nan),
+                'reflection_index': features.get('reflection_index', np.nan),
+            }
             
+            features_list.append(feature_record)
+        
+        # Log extraction statistics
+        logger.info(f"Feature extraction complete:")
+        logger.info(f"  Total cycles: {stats['total']}")
+        logger.info(f"  Valid: {stats['valid']} ({100*stats['valid']/max(1,stats['total']):.1f}%)")
+        logger.info(f"  Invalid (flat signal): {stats['invalid_flat']}")
+        logger.info(f"  Invalid (out of bounds): {stats['invalid_features']}")
+        logger.info(f"  Invalid (PTT range): {stats['invalid_ptt_range']}")
+        
         return pd.DataFrame(features_list)
 
     def process_recording(self, file_path: str) -> pd.DataFrame:
