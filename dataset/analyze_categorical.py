@@ -6,8 +6,9 @@ import seaborn as sns
 import os
 import numpy as np
 from scipy import stats
+import argparse
 
-def analyze_categorical(csv_path='./data/processed/bp_dataset_features.csv', output_dir='./data/figures'):
+def analyze_categorical(csv_path, output_dir='./data/figures'):
     if not os.path.exists(csv_path):
         print(f"File {csv_path} not found.")
         return
@@ -79,4 +80,18 @@ def analyze_categorical(csv_path='./data/processed/bp_dataset_features.csv', out
         print(f"Saved boxplot to bp_by_{safe_col_name}.png")
 
 if __name__ == "__main__":
-    analyze_categorical()
+
+    """Main training loop with advanced techniques."""
+    parser = argparse.ArgumentParser(description='Train Temporal Transformer for BP Estimation')
+    
+    # Data parameters
+    parser.add_argument('--data_path', type=str, default='src/data/bp_dataset_features.csv',
+                       help='Path to the dataset file (CSV or Excel)')
+    
+    parser.add_argument('--output_dir', type=str, default='./data/figures',
+                          help='Directory to save output figures')
+    
+    analyze_categorical(
+        csv_path=parser.parse_args().data_path,
+        output_dir=parser.parse_args().output_dir
+    )
