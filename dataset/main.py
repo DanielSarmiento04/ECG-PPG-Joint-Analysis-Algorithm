@@ -277,7 +277,7 @@ def main():
     
     # Configuration
     MIN_DURATION_MIN = 30  # Minimum case duration in minutes
-    MAX_CASES_TO_DOWNLOAD = 50  # Set to None to download all available cases
+    MAX_CASES_TO_DOWNLOAD = None  # Set to None to download all available cases
     USE_ENHANCED_PARAMS = False  # Set True to include hemodynamic parameters
     
     print("=" * 80)
@@ -338,9 +338,9 @@ def main():
     print(f"  Raw data: {downloader.raw_data_dir}")
     print(f"  Metadata: {downloader.metadata_dir}")
     print("\nNext steps:")
-    print("  1. Run 'python data_exploration.py' to explore the downloaded data")
-    print("  2. Run feature extraction pipeline")
-    print("  3. Train BP estimation model")
+    print("  1. Run 'python run_full_batch.py' to extract features")
+    print("  2. Run 'python data_cleaning.py' to clean the dataset")
+    print("  3. Run 'python feature_analysis.py' to analyze results")
 
 
 if __name__ == "__main__":
