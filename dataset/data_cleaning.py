@@ -38,17 +38,21 @@ class DataCleaner:
     # Default physiological thresholds
     DEFAULT_THRESHOLDS = {
         # PTT thresholds (milliseconds) - within-cycle timing
-        # ptt_peak_to_peak: time from cycle start to systolic peak (typically 50-400ms)
-        'ptt_peak_to_peak_min': 20,   # Very fast rise
-        'ptt_peak_to_peak_max': 600,  # Slow rise (low HR, elderly)
-        # ptt_peak_to_foot: time from cycle start to PPG foot (typically 20-200ms)
-        'ptt_peak_to_foot_min': 10,   # Allow fast transit
-        'ptt_peak_to_foot_max': 300,  # Allow slower transit
+        # ptt_peak_to_peak: time from R-peak (cycle start) to PPG systolic peak
+        # Expected: 150-450ms (time for pulse wave to reach finger + systolic upstroke)
+        'ptt_peak_to_peak_min': 100,  # Minimum realistic (fast transit + fast upstroke)
+        'ptt_peak_to_peak_max': 500,  # Maximum realistic (slow transit, elderly)
+        
+        # ptt_peak_to_foot: time from R-peak (cycle start) to PPG foot (pulse arrival)
+        # Expected: 100-300ms (pulse transit time from heart to finger)
+        # This is equivalent to PAT (Pulse Arrival Time)
+        'ptt_peak_to_foot_min': 50,   # Fast transit (young, fit)
+        'ptt_peak_to_foot_max': 350,  # Slow transit (elderly, arterial stiffness)
         
         # PAT thresholds (R-peak to PPG foot) - TRUE pulse transit time
         # This is the physiologically meaningful measure (typically 100-350ms)
-        'pat_ecg_ppg_min': 10,    # Minimum PAT (fast)
-        'pat_ecg_ppg_max': 500,   # Maximum PAT (slow)
+        'pat_ecg_ppg_min': 50,    # Minimum PAT (fast)
+        'pat_ecg_ppg_max': 350,   # Maximum PAT (slow)
         
         # Blood pressure thresholds (mmHg)
         'sbp_min': 60,

@@ -257,7 +257,7 @@ class FixedFeatureExtractor:
         """
         max_search_samples = min(int(max_search_ms / 1000 * self.fs), len(ppg_segment))
         
-        if len(ppg_segment) < 20:
+        if len(ppg_segment) < 50:  # Need at least 100ms of signal
             return 0, 0.0
             
         # Normalize the segment
@@ -272,47 +272,68 @@ class FixedFeatureExtractor:
         # Smooth the signal
         smoothed = gaussian_filter1d(search_region, sigma=2)
         
-        # Find systolic peak first (in first 70% of search region)
-        peak_search_end = min(int(len(smoothed) * 0.7), int(0.4 * self.fs))  # max 400ms
-        if peak_search_end < 5:
-            return 0, 0.0
-        peak_idx = int(np.argmax(smoothed[:peak_search_end]))
+        # Skip first 25ms (12-13 samples at 500Hz) to avoid ECG artifact
+        # The PPG foot physiologically occurs at ~50-200ms after R-peak
+        skip_samples = int(0.025 * self.fs)  # 25ms = 12-13 samples
         
-        # If peak is at very start, signal is likely inverted or noisy
-        if peak_idx < 5:
-            return 0, 0.0
+        # Find systolic peak in region 50-500ms (skip artifacts at start)
+        peak_search_start = int(0.050 * self.fs)  # 50ms
+        peak_search_end = min(int(0.500 * self.fs), len(smoothed))  # 500ms
         
-        # Search for foot only BEFORE the peak
-        foot_search_region = smoothed[:peak_idx]
+        if peak_search_end <= peak_search_start + 10:
+            return 0, 0.0
+            
+        peak_region = smoothed[peak_search_start:peak_search_end]
+        local_peak_idx = int(np.argmax(peak_region))
+        peak_idx = peak_search_start + local_peak_idx
+        
+        # Search for foot between 25ms and peak (but not in the artifact region)
+        foot_search_start = skip_samples
+        foot_search_end = peak_idx
+        
+        if foot_search_end <= foot_search_start + 5:
+            # Very short search region - use a default
+            foot_idx = int(0.075 * self.fs)  # Default to 75ms
+            return foot_idx, float(foot_idx / self.fs * 1000)
+        
+        foot_search_region = smoothed[foot_search_start:foot_search_end]
         
         if len(foot_search_region) < 5:
-            return 0, 0.0
+            foot_idx = int(0.075 * self.fs)
+            return foot_idx, float(foot_idx / self.fs * 1000)
         
-        # === Method 1: Second derivative maximum ===
+        # === Method 1: Second derivative maximum (in search region) ===
         d1 = np.diff(smoothed)
         d2 = np.diff(d1)
         
-        # Find max second derivative before peak (acceleration = foot)
-        d2_search = d2[:max(1, peak_idx-1)]
-        if len(d2_search) > 0:
-            foot_d2 = int(np.argmax(d2_search))
+        # Second derivative in the search region
+        d2_start = max(0, foot_search_start - 1)
+        d2_end = min(len(d2), foot_search_end - 1)
+        
+        if d2_end > d2_start:
+            d2_search = d2[d2_start:d2_end]
+            if len(d2_search) > 0:
+                foot_d2 = foot_search_start + int(np.argmax(d2_search))
+            else:
+                foot_d2 = 0
         else:
             foot_d2 = 0
             
         # === Method 2: Intersecting tangent ===
-        d_ppg = d1[:peak_idx] if peak_idx < len(d1) else d1
-        if len(d_ppg) > 0:
-            max_slope_idx = np.argmax(d_ppg)
-            max_slope = d_ppg[max_slope_idx]
+        d_search = d1[foot_search_start:foot_search_end] if foot_search_end < len(d1) else d1[foot_search_start:]
+        
+        if len(d_search) > 0:
+            max_slope_local_idx = np.argmax(d_search)
+            max_slope_idx = foot_search_start + max_slope_local_idx
+            max_slope = d_search[max_slope_local_idx]
             
-            if max_slope > 0 and max_slope_idx > 0:
-                min_idx_before = np.argmin(foot_search_region[:max_slope_idx])
-                min_val = foot_search_region[min_idx_before]
+            if max_slope > 0.01:  # Need meaningful slope
                 ppg_at_slope = smoothed[max_slope_idx]
+                min_val = np.min(foot_search_region[:max_slope_local_idx]) if max_slope_local_idx > 0 else 0
                 
                 # Intersecting tangent calculation
                 foot_tangent = max_slope_idx - (ppg_at_slope - min_val) / max_slope
-                foot_tangent = int(max(0, min(foot_tangent, peak_idx - 1)))
+                foot_tangent = int(max(foot_search_start, min(foot_tangent, foot_search_end - 1)))
             else:
                 foot_tangent = 0
         else:
@@ -322,32 +343,32 @@ class FixedFeatureExtractor:
         threshold = 0.1
         above_threshold = np.where(foot_search_region > threshold)[0]
         if len(above_threshold) > 0:
-            foot_threshold = int(above_threshold[0])
+            foot_threshold = foot_search_start + int(above_threshold[0])
         else:
             foot_threshold = 0
             
-        # === Method 4: Minimum before peak ===
-        foot_min = int(np.argmin(foot_search_region))
+        # === Method 4: Minimum in search region ===
+        foot_min = foot_search_start + int(np.argmin(foot_search_region))
         
         # === Consensus: Use median of valid estimates ===
         candidates = []
         
-        # Validate each candidate (must be in physiological range: 20-200ms = 10-100 samples at 500Hz)
-        min_foot_samples = int(0.020 * self.fs)  # 20ms
-        max_foot_samples = int(0.250 * self.fs)  # 250ms
+        # Physiological range for PPG foot: 25-200ms from R-peak (12-100 samples at 500Hz)
+        min_foot_samples = int(0.025 * self.fs)  # 25ms
+        max_foot_samples = int(0.200 * self.fs)  # 200ms
         
         for foot_est in [foot_d2, foot_tangent, foot_threshold, foot_min]:
-            # Must be positive, before peak, and in physiological range
+            # Must be in physiological range and before peak
             if min_foot_samples <= foot_est <= min(max_foot_samples, peak_idx - 1):
                 candidates.append(foot_est)
         
         if len(candidates) == 0:
-            # Fallback: use minimum point before peak if it's not at the very start
-            if 5 < foot_min < peak_idx:
+            # Fallback: use minimum point in search region
+            if foot_search_start < foot_min < foot_search_end:
                 foot_idx = foot_min
             else:
-                # Last resort: estimate as 25% of time to peak
-                foot_idx = max(1, peak_idx // 4)
+                # Last resort: estimate at 75ms (typical foot location)
+                foot_idx = int(0.075 * self.fs)
         elif len(candidates) == 1:
             foot_idx = candidates[0]
         else:
@@ -363,6 +384,10 @@ class FixedFeatureExtractor:
         """
         Find the systolic peak in PPG waveform.
         
+        IMPORTANT: PPG cycles extracted R-peak to R-peak have initial artifact/noise
+        from the ECG. The systolic peak occurs ~100-400ms after the R-peak,
+        corresponding to the pulse wave arriving at the finger.
+        
         Args:
             ppg_segment: PPG waveform (should be normalized 0-1)
             min_prominence: Minimum prominence for peak detection
@@ -376,24 +401,45 @@ class FixedFeatureExtractor:
         if ppg_max - ppg_min > 1e-6:
             ppg_norm = (ppg_segment - ppg_min) / (ppg_max - ppg_min)
         else:
-            return 0, 0.0
-            
-        # CONSTRAINT: Systolic peak typically occurs in the first 600ms or 70% of cycle
-        # This prevents detecting the end of the cycle as a peak (baseline drift)
-        max_search_samples = int(min(len(ppg_norm) * 0.7, 0.6 * self.fs))
-        search_region = ppg_norm[:max_search_samples]
+            return len(ppg_segment) // 3, 0.5  # Safe default
         
-        # Find peaks in the constrained region
-        peaks, properties = sig.find_peaks(search_region, prominence=min_prominence)
+        # Skip the initial ECG artifact region (first 50ms at 500Hz = 25 samples)
+        # The PPG systolic peak physiologically occurs at ~100-400ms after R-peak
+        # due to pulse transit time from heart to finger
+        min_peak_delay_ms = 50  # Reduced to allow faster transit times
+        min_search_start = int(min_peak_delay_ms / 1000 * self.fs)
+        
+        # Also ensure we have enough signal after the minimum delay
+        if len(ppg_norm) < min_search_start + 20:
+            # Very short cycle - use global argmax as fallback
+            peak_idx = int(np.argmax(ppg_norm))
+            return peak_idx, float(ppg_norm[peak_idx])
+        
+        # Search region: from 50ms to 600ms (or 70% of cycle)
+        # This avoids ECG artifacts at the very start and baseline drift at the end
+        max_search_end = int(min(len(ppg_norm) * 0.7, 0.6 * self.fs))
+        max_search_end = max(max_search_end, min_search_start + 50)  # At least 50 samples to search
+        
+        search_region = ppg_norm[min_search_start:max_search_end]
+        
+        if len(search_region) < 10:
+            # Fallback for very short segments
+            peak_idx = int(np.argmax(ppg_norm))
+            return peak_idx, float(ppg_norm[peak_idx])
+        
+        # Find peaks in the constrained region with reduced prominence requirement
+        peaks, properties = sig.find_peaks(search_region, prominence=min_prominence * 0.5)
         
         if len(peaks) == 0:
             # Fallback: use argmax in the constrained region
-            peak_idx = int(np.argmax(search_region))
+            local_peak_idx = int(np.argmax(search_region))
+            peak_idx = min_search_start + local_peak_idx  # Convert back to full signal index
             return peak_idx, float(ppg_norm[peak_idx])
         
         # Take the most prominent peak (usually systolic)
         most_prominent_idx = np.argmax(properties['prominences'])
-        peak_idx = int(peaks[most_prominent_idx])
+        local_peak_idx = int(peaks[most_prominent_idx])
+        peak_idx = min_search_start + local_peak_idx  # Convert back to full signal index
         
         return peak_idx, float(ppg_norm[peak_idx])
     
