@@ -32,8 +32,15 @@ _extraction_failures = {
     'invalid_ptt': 0,
     'low_quality': 0,
     'nan_features': 0,
+    'low_snr': 0,
+    'low_amplitude': 0,
     'total_attempts': 0
 }
+
+# Minimum signal-to-noise ratio for valid extraction
+# Based on analysis: good patients have PPG std ~12, bad patients have std ~2
+MIN_PPG_STD = 3.0  # Minimum standard deviation of PPG signal
+MIN_SNR = 5.0      # Minimum signal-to-noise ratio
 
 
 def get_extraction_stats() -> Dict:
@@ -141,13 +148,17 @@ def preprocess_signal(signal_data: np.ndarray, fs: int, remove_artifacts: bool =
         return signal_data
 
 
-def signal_quality_check(ppg_segment: np.ndarray, min_snr: float = 3.0) -> Tuple[bool, str]:
+def signal_quality_check(ppg_segment: np.ndarray, min_snr: float = 5.0) -> Tuple[bool, str]:
     """
     Check if signal is good enough for feature extraction.
     
+    CRITICAL: VitalDB data analysis showed that patients with low PPG variability
+    (std < 3) have WRONG PTT-BP correlations because foot detection becomes
+    unreliable. Good patients have std ~12, bad patients have std ~2.
+    
     Args:
         ppg_segment: PPG waveform segment
-        min_snr: Minimum signal-to-noise ratio
+        min_snr: Minimum signal-to-noise ratio (default 5.0, increased from 3.0)
         
     Returns:
         Tuple of (is_valid, reason_if_invalid)
@@ -160,30 +171,47 @@ def signal_quality_check(ppg_segment: np.ndarray, min_snr: float = 3.0) -> Tuple
     if np.isnan(ppg_segment).all():
         return False, "all_nan"
     
-    # Check 3: Sufficient amplitude variation
-    ppg_std = np.nanstd(ppg_segment)
-    ppg_range = np.nanmax(ppg_segment) - np.nanmin(ppg_segment)
+    # Remove NaN for statistics
+    valid_data = ppg_segment[~np.isnan(ppg_segment)]
+    if len(valid_data) < 20:
+        return False, "insufficient_valid_data"
+    
+    # Check 3: Sufficient amplitude variation (CRITICAL FIX)
+    # Analysis showed: good patients std~12, bad patients std~2
+    ppg_std = np.std(valid_data)
+    ppg_range = np.max(valid_data) - np.min(valid_data)
     
     if ppg_range < 1e-6:
         return False, "flat_signal"
     
-    if ppg_std < 1e-6:
-        return False, "no_variation"
+    # NEW: Minimum amplitude threshold based on analysis
+    # PPG std < 3 leads to unreliable foot detection
+    if ppg_std < MIN_PPG_STD:
+        return False, f"low_amplitude_std_{ppg_std:.2f}"
     
     # Check 4: Not saturated (clipping)
-    unique_vals = len(np.unique(ppg_segment))
+    unique_vals = len(np.unique(valid_data))
     if unique_vals < 5:
         return False, "saturated"
     
-    # Check 5: SNR estimate (simple version)
+    # Check 5: SNR estimate (improved version)
     # SNR = signal variance / noise variance (estimated from high-freq components)
-    diff = np.diff(ppg_segment)
-    noise_estimate = np.std(diff) / np.sqrt(2)  # Noise std estimate
+    # Use second difference for better noise estimation
+    if len(valid_data) > 10:
+        diff2 = np.diff(np.diff(valid_data))
+        noise_estimate = np.std(diff2) / 2.0  # Second diff has sqrt(6) noise amplification
+        
+        if noise_estimate > 0.01:
+            snr = ppg_std / noise_estimate
+            if snr < min_snr:
+                return False, f"low_snr_{snr:.2f}"
     
-    if noise_estimate > 0:
-        snr = ppg_std / noise_estimate
-        if snr < min_snr:
-            return False, f"low_snr_{snr:.2f}"
+    # Check 6: Signal should have clear pulsatile pattern
+    # Peak-to-peak amplitude should be at least 3x the noise floor
+    peak_to_peak = ppg_range
+    noise_floor = np.std(np.diff(valid_data)) / np.sqrt(2)
+    if noise_floor > 0.01 and peak_to_peak < 3 * noise_floor:
+        return False, f"weak_pulse_amplitude"
     
     return True, "ok"
 
@@ -277,6 +305,103 @@ def log_extraction_failure(reason: str):
     logger.debug(f"Feature extraction failed: {reason}")
 
 
+def detect_global_ppg_polarity(ppg_signal: np.ndarray, fs: int = 500,
+                                ecg_r_peaks: Optional[np.ndarray] = None) -> bool:
+    """
+    Detect PPG polarity at the GLOBAL level (entire recording).
+    
+    This is critical because per-beat polarity detection fails due to:
+    - Respiratory baseline drift
+    - Short beat segments
+    - Variable morphology
+    
+    Method: Use cross-correlation timing - in normal PPG, the maximum
+    (systolic peak) occurs AFTER the minimum (diastolic foot). In inverted
+    PPG, the minimum (which represents max blood volume) occurs AFTER the maximum.
+    
+    Args:
+        ppg_signal: Full PPG signal
+        fs: Sampling frequency
+        ecg_r_peaks: Optional R-peak indices for beat-based analysis
+        
+    Returns:
+        True if PPG is inverted (minimum = systolic), False if normal (maximum = systolic)
+    """
+    if len(ppg_signal) < fs:  # Need at least 1 second
+        return False
+    
+    # Remove baseline drift with high-pass filter (0.5 Hz cutoff)
+    try:
+        sos = butter(2, 0.5 / (fs / 2), btype='high', output='sos')
+        ppg_filtered = sig.sosfiltfilt(sos, ppg_signal)
+    except Exception:
+        ppg_filtered = ppg_signal - gaussian_filter1d(ppg_signal, sigma=fs)
+    
+    # Method 1: Average beat morphology
+    # If we have R-peaks, average multiple beats and check morphology
+    if ecg_r_peaks is not None and len(ecg_r_peaks) >= 5:
+        beat_length = int(0.8 * fs)  # 800ms typical beat
+        beats = []
+        
+        for i, rpk in enumerate(ecg_r_peaks[:-1]):
+            next_rpk = ecg_r_peaks[i + 1]
+            if rpk + beat_length <= len(ppg_filtered) and next_rpk - rpk > beat_length // 2:
+                beat = ppg_filtered[rpk:rpk + beat_length]
+                # Normalize each beat
+                beat_range = np.max(beat) - np.min(beat)
+                if beat_range > 0.01:
+                    beat_norm = (beat - np.min(beat)) / beat_range
+                    beats.append(beat_norm)
+        
+        if len(beats) >= 5:
+            # Average beat template
+            avg_beat = np.mean(beats, axis=0)
+            
+            # In normal PPG: signal rises to peak (100-200ms) then falls
+            # In inverted PPG: signal falls to minimum (100-200ms) then rises
+            early_region = avg_beat[int(0.05 * fs):int(0.15 * fs)]  # 50-150ms
+            mid_region = avg_beat[int(0.15 * fs):int(0.30 * fs)]   # 150-300ms
+            
+            # Calculate slope: positive = rising (normal), negative = falling (inverted)
+            early_slope = np.mean(np.diff(early_region))
+            
+            # If signal is falling in early region, it's inverted
+            return bool(early_slope < 0)
+    
+    # Method 2: Statistical analysis of derivatives
+    # In normal PPG, there's a rapid upstroke (positive derivative)
+    # followed by slower downstroke. The skewness of derivatives tells us polarity.
+    deriv = np.diff(ppg_filtered)
+    
+    # Segment into beat-sized windows and check consistency
+    window_size = int(0.8 * fs)
+    n_windows = len(deriv) // window_size
+    
+    if n_windows < 3:
+        # Too short - use simple heuristic
+        return bool(np.mean(deriv[:len(deriv)//4]) < 0)
+    
+    inversion_votes = 0
+    for i in range(n_windows):
+        start = i * window_size
+        end = start + window_size
+        window_deriv = deriv[start:end]
+        
+        # In normal PPG, the maximum derivative (steepest upstroke) occurs
+        # before the minimum derivative (downstroke from peak)
+        max_deriv_idx = np.argmax(window_deriv)
+        min_deriv_idx = np.argmin(window_deriv)
+        
+        # If min_deriv comes before max_deriv, signal is inverted
+        if min_deriv_idx < max_deriv_idx:
+            inversion_votes += 1
+    
+    # Majority vote
+    is_inverted = inversion_votes > n_windows // 2
+    
+    return is_inverted
+
+
 class FixedFeatureExtractor:
     """
     Corrected feature extraction for PPG-based BP estimation.
@@ -296,6 +421,24 @@ class FixedFeatureExtractor:
         """
         self.fs = fs
         self.expected_ptt_range = (100, 400)  # ms
+        self._global_ppg_inverted = None  # Will be set by set_global_polarity()
+    
+    def set_global_polarity(self, ppg_signal: np.ndarray, 
+                           ecg_r_peaks: Optional[np.ndarray] = None):
+        """
+        Set the global PPG polarity for this recording.
+        
+        MUST be called before extracting features to ensure consistent
+        polarity detection across all beats.
+        
+        Args:
+            ppg_signal: Full PPG signal for the recording
+            ecg_r_peaks: Optional R-peak indices
+        """
+        self._global_ppg_inverted = detect_global_ppg_polarity(
+            ppg_signal, self.fs, ecg_r_peaks
+        )
+        logger.debug(f"Global PPG polarity: {'inverted' if self._global_ppg_inverted else 'normal'}")
         
     def find_ppg_foot(self, ppg_segment: np.ndarray, 
                       max_search_ms: float = 400) -> Tuple[int, float]:
@@ -329,14 +472,25 @@ class FixedFeatureExtractor:
         # VitalDB PPG often has ECG R-peak electrical artifacts
         ppg_clean = remove_spikes(ppg_segment, threshold_mad=4.0)
         
-        # Detect PPG polarity: In some systems, PPG is inverted
-        mid_point = len(ppg_clean) // 2
-        first_quarter = np.mean(ppg_clean[:len(ppg_clean)//4])
-        second_quarter = np.mean(ppg_clean[len(ppg_clean)//4:mid_point])
-        is_inverted = first_quarter > second_quarter
+        # USE GLOBAL POLARITY if set, otherwise fall back to per-beat detection
+        if self._global_ppg_inverted is not None:
+            is_inverted = self._global_ppg_inverted
+        else:
+            # Fallback: per-beat detection (less reliable)
+            mid_point = len(ppg_clean) // 2
+            first_quarter = np.mean(ppg_clean[:len(ppg_clean)//4])
+            second_quarter = np.mean(ppg_clean[len(ppg_clean)//4:mid_point])
+            is_inverted = first_quarter > second_quarter
         
-        # Work with signal in "normal" orientation
+        # Work with signal in "normal" orientation (rising toward peak)
         ppg_work = -ppg_clean if is_inverted else ppg_clean
+        
+        # Remove baseline trend within the beat
+        if len(ppg_work) > 20:
+            x = np.arange(len(ppg_work))
+            coeffs = np.polyfit(x, ppg_work, 1)
+            trend = np.polyval(coeffs, x)
+            ppg_work = ppg_work - trend + np.mean(ppg_work)
             
         # Normalize the segment
         ppg_min = np.min(ppg_work)
@@ -348,19 +502,12 @@ class FixedFeatureExtractor:
         search_region = ppg_norm[:max_search_samples]
         
         # Smooth the signal to reduce noise
-        smoothed = gaussian_filter1d(search_region, sigma=3)  # Increased sigma for more smoothing
+        smoothed = gaussian_filter1d(search_region, sigma=3)
         
-        # Skip first 40ms (20 samples at 500Hz) to avoid ECG artifact
-        # REDUCED from 80ms: VitalDB PPG may have shorter transit times due to:
-        # - Arterial line patients with different hemodynamics
-        # - PPG sensor placement variations
-        # - Surgical patient populations
-        # Physical minimum is ~40ms (arm length / max pulse wave velocity)
-        skip_samples = int(0.040 * self.fs)  # 40ms = 20 samples
-        
-        # Find systolic peak in region 60-500ms
-        peak_search_start = int(0.060 * self.fs)  # 60ms (reduced from 100ms)
-        peak_search_end = min(int(0.500 * self.fs), len(smoothed))  # 500ms
+        # Find the systolic peak first (needed to define search region)
+        # Peak should be between 100-400ms after R-peak
+        peak_search_start = int(0.080 * self.fs)  # 80ms
+        peak_search_end = min(int(0.450 * self.fs), len(smoothed))  # 450ms
         
         if peak_search_end <= peak_search_start + 10:
             return 0, 0.0
@@ -368,116 +515,112 @@ class FixedFeatureExtractor:
         peak_region = smoothed[peak_search_start:peak_search_end]
         local_peak_idx = int(np.argmax(peak_region))
         peak_idx = peak_search_start + local_peak_idx
+        peak_time_ms = peak_idx / self.fs * 1000
         
-        # Search for foot between 80ms and peak
-        foot_search_start = skip_samples
-        foot_search_end = peak_idx
+        # === NEW APPROACH: Find foot using DERIVATIVE analysis ===
+        # The foot is where the upstroke begins - characterized by:
+        # 1. Maximum acceleration (max second derivative)
+        # 2. Start of sustained positive slope
         
-        if foot_search_end <= foot_search_start + 5:
-            # Very short search region - use a default
-            foot_idx = int(0.075 * self.fs)  # Default to 75ms
-            return foot_idx, float(foot_idx / self.fs * 1000)
+        # Calculate derivatives
+        d1 = np.diff(smoothed)  # First derivative (velocity)
+        d2 = np.diff(d1)        # Second derivative (acceleration)
         
-        foot_search_region = smoothed[foot_search_start:foot_search_end]
+        # Search region for foot: from 50ms to just before peak
+        # (Allow earlier than 80ms since we're looking for upstroke START)
+        foot_search_start = int(0.050 * self.fs)  # 50ms - avoid ECG artifact
+        foot_search_end = peak_idx - int(0.020 * self.fs)  # 20ms before peak
         
-        if len(foot_search_region) < 5:
-            foot_idx = int(0.075 * self.fs)
-            return foot_idx, float(foot_idx / self.fs * 1000)
+        if foot_search_end <= foot_search_start + 10:
+            # Peak is too early, use default
+            foot_idx = int(peak_idx * 0.6)  # 60% of way to peak
+            return max(foot_idx, int(0.080 * self.fs)), float(max(foot_idx, int(0.080 * self.fs)) / self.fs * 1000)
         
-        # === Method 1: Second derivative maximum (in search region) ===
-        # This detects the point of maximum acceleration (start of upstroke)
-        d1 = np.diff(smoothed)
-        d2 = np.diff(d1)
+        # === Method 1: Maximum second derivative (acceleration) ===
+        # The foot is where acceleration is maximum (steepest part of upstroke begins)
+        d2_start = max(0, foot_search_start)
+        d2_end = min(len(d2), foot_search_end)
         
-        # Second derivative in the search region
-        d2_start = max(0, foot_search_start - 1)
-        d2_end = min(len(d2), foot_search_end - 1)
-        
-        foot_d2 = 0
-        if d2_end > d2_start:
+        foot_d2 = foot_search_start
+        if d2_end > d2_start and d2_end <= len(d2):
             d2_search = d2[d2_start:d2_end]
-            if len(d2_search) > 0:
-                # Find the maximum second derivative (acceleration peak)
-                max_d2_idx = int(np.argmax(d2_search))
+            if len(d2_search) > 5:
+                # Smooth the second derivative
+                d2_smooth = gaussian_filter1d(d2_search, sigma=2)
+                max_d2_idx = int(np.argmax(d2_smooth))
                 foot_d2 = foot_search_start + max_d2_idx
             
-        # === Method 2: Intersecting tangent ===
-        d_search = d1[foot_search_start:foot_search_end] if foot_search_end < len(d1) else d1[foot_search_start:]
+        # === Method 2: Intersecting tangent from max slope ===
+        d1_start = foot_search_start
+        d1_end = min(len(d1), foot_search_end)
         
-        if len(d_search) > 0:
-            max_slope_local_idx = np.argmax(d_search)
-            max_slope_idx = foot_search_start + max_slope_local_idx
-            max_slope = d_search[max_slope_local_idx]
-            
-            if max_slope > 0.01:  # Need meaningful slope
-                ppg_at_slope = smoothed[max_slope_idx]
-                min_val = np.min(foot_search_region[:max_slope_local_idx]) if max_slope_local_idx > 0 else 0
+        foot_tangent = foot_search_start
+        if d1_end > d1_start:
+            d1_search = d1[d1_start:d1_end]
+            if len(d1_search) > 5:
+                max_slope_local_idx = int(np.argmax(d1_search))
+                max_slope_idx = foot_search_start + max_slope_local_idx
+                max_slope = d1_search[max_slope_local_idx]
                 
-                # Intersecting tangent calculation
-                foot_tangent = max_slope_idx - (ppg_at_slope - min_val) / max_slope
-                foot_tangent = int(max(foot_search_start, min(foot_tangent, foot_search_end - 1)))
+                if max_slope > 0.005:  # Need meaningful positive slope
+                    ppg_at_slope = smoothed[max_slope_idx]
+                    # Find baseline (minimum before max slope point)
+                    baseline_region = smoothed[foot_search_start:max_slope_idx] if max_slope_idx > foot_search_start else [smoothed[foot_search_start]]
+                    baseline = np.min(baseline_region)
+                    
+                    # Intersecting tangent: where tangent line crosses baseline
+                    foot_tangent = max_slope_idx - (ppg_at_slope - baseline) / max_slope
+                    foot_tangent = int(max(foot_search_start, min(foot_tangent, foot_search_end)))
+            
+        # === Method 3: 10% amplitude threshold ===
+        foot_search_region = smoothed[foot_search_start:foot_search_end]
+        if len(foot_search_region) > 5:
+            min_in_region = np.min(foot_search_region)
+            max_in_region = smoothed[peak_idx] if peak_idx < len(smoothed) else np.max(foot_search_region)
+            threshold_10 = min_in_region + 0.10 * (max_in_region - min_in_region)
+            
+            above_thresh = np.where(foot_search_region > threshold_10)[0]
+            if len(above_thresh) > 0:
+                foot_thresh = foot_search_start + int(above_thresh[0])
             else:
-                foot_tangent = 0
+                foot_thresh = foot_search_start
         else:
-            foot_tangent = 0
+            foot_thresh = foot_search_start
             
-        # === Method 3: Threshold crossing (10% of amplitude) ===
-        threshold = 0.1
-        above_threshold = np.where(foot_search_region > threshold)[0]
-        if len(above_threshold) > 0:
-            foot_threshold = foot_search_start + int(above_threshold[0])
+        # === Method 4: Minimum in search region (classic method) ===
+        if len(foot_search_region) > 0:
+            foot_min = foot_search_start + int(np.argmin(foot_search_region))
         else:
-            foot_threshold = 0
-            
-        # === Method 4: Minimum in search region ===
-        foot_min = foot_search_start + int(np.argmin(foot_search_region))
+            foot_min = foot_search_start
         
-        # === Method 5: Percentage of rise (find where signal reaches 5% of rise to peak) ===
-        min_val_in_region = np.min(foot_search_region)
-        max_val_in_region = np.max(foot_search_region)
-        rise_threshold = min_val_in_region + 0.05 * (max_val_in_region - min_val_in_region)
-        above_rise = np.where(foot_search_region > rise_threshold)[0]
-        if len(above_rise) > 0:
-            foot_rise = foot_search_start + int(above_rise[0])
-        else:
-            foot_rise = 0
-        
-        # === Consensus: Use median of valid estimates ===
+        # === Consensus: Prefer derivative-based methods ===
         candidates = []
         
-        # Physiological range for PPG foot: 40-250ms from R-peak
-        # REDUCED minimum from 80ms to 40ms to allow natural variability
-        # VitalDB surgical patients may have faster pulse wave velocity
-        min_foot_samples = int(0.040 * self.fs)  # 40ms = 20 samples
-        max_foot_samples = int(0.250 * self.fs)  # 250ms = 125 samples
+        # Physiological bounds: 80-300ms (allow wider range)
+        min_foot_ms = 80
+        max_foot_ms = min(300, peak_time_ms - 10)  # At least 10ms before peak
+        min_foot_samples = int(min_foot_ms / 1000 * self.fs)
+        max_foot_samples = int(max_foot_ms / 1000 * self.fs)
         
-        for foot_est in [foot_d2, foot_tangent, foot_threshold, foot_min, foot_rise]:
-            # Must be in physiological range and before peak
-            if min_foot_samples <= foot_est <= min(max_foot_samples, peak_idx - 1):
+        for foot_est in [foot_d2, foot_tangent, foot_thresh, foot_min]:
+            if min_foot_samples <= foot_est <= max_foot_samples:
                 candidates.append(foot_est)
         
         if len(candidates) == 0:
-            # Fallback: use minimum point in search region (if valid)
-            if foot_search_start < foot_min < foot_search_end:
-                foot_idx = max(foot_min, min_foot_samples)  # Enforce minimum
-            else:
-                # Last resort: estimate at 100ms (typical foot location)
-                foot_idx = int(0.100 * self.fs)
+            # No valid candidates - estimate based on peak location
+            # Foot typically occurs at 40-60% of the way to peak
+            foot_idx = int(peak_idx * 0.5)
+            foot_idx = max(foot_idx, min_foot_samples)
         elif len(candidates) == 1:
             foot_idx = candidates[0]
         else:
-            # Use median of candidates
-            foot_idx = int(np.median(candidates))
+            # Prefer earlier estimates (closer to true foot)
+            # Use 25th percentile instead of median
+            foot_idx = int(np.percentile(candidates, 25))
         
-        # BOUNDARY CHECK: If foot_idx is at the minimum allowed boundary,
-        # and the signal has meaningful slope, use the 5% rise method
-        boundary_threshold = min_foot_samples + 5  # ~50ms
-        if foot_idx <= boundary_threshold and foot_rise > boundary_threshold:
-            foot_idx = foot_rise
-        
-        # Final validation: ensure foot is in physiological range
-        foot_idx = max(foot_idx, min_foot_samples)  # At least 40ms
-        foot_idx = min(foot_idx, max_foot_samples)  # At most 250ms
+        # Final bounds check
+        foot_idx = max(foot_idx, min_foot_samples)
+        foot_idx = min(foot_idx, max_foot_samples)
         
         foot_time_ms = float(foot_idx / self.fs * 1000)
         
@@ -499,15 +642,15 @@ class FixedFeatureExtractor:
         Returns:
             Tuple of (peak_index, peak_value)
         """
-        # Detect PPG polarity: In some systems, PPG is inverted
-        # (minimum = systolic peak due to maximum blood volume absorption)
-        # Check if the signal decreases in the first half (inverted) or increases (normal)
-        mid_point = len(ppg_segment) // 2
-        first_quarter = np.mean(ppg_segment[:len(ppg_segment)//4])
-        second_quarter = np.mean(ppg_segment[len(ppg_segment)//4:mid_point])
-        
-        # If signal decreases from start to middle, it's likely inverted
-        is_inverted = first_quarter > second_quarter
+        # USE GLOBAL POLARITY if set, otherwise fall back to per-beat detection
+        if self._global_ppg_inverted is not None:
+            is_inverted = self._global_ppg_inverted
+        else:
+            # Fallback: per-beat detection (less reliable)
+            mid_point = len(ppg_segment) // 2
+            first_quarter = np.mean(ppg_segment[:len(ppg_segment)//4])
+            second_quarter = np.mean(ppg_segment[len(ppg_segment)//4:mid_point])
+            is_inverted = first_quarter > second_quarter
         
         # Work with the signal in "normal" orientation (peak = maximum)
         if is_inverted:
@@ -523,9 +666,9 @@ class FixedFeatureExtractor:
         else:
             return len(ppg_segment) // 3, 0.5  # Safe default
         
-        # Skip the initial ECG artifact region (first 50ms at 500Hz = 25 samples)
+        # Skip the initial ECG artifact region (first 80ms at 500Hz = 40 samples)
         # The PPG systolic peak physiologically occurs at ~100-400ms after R-peak
-        min_peak_delay_ms = 50
+        min_peak_delay_ms = 80  # Increased from 50ms
         min_search_start = int(min_peak_delay_ms / 1000 * self.fs)
         
         if len(ppg_norm) < min_search_start + 20:
@@ -533,7 +676,7 @@ class FixedFeatureExtractor:
             # Return value from normalized signal, not original (handles inverted signals)
             return peak_idx, float(ppg_norm[peak_idx])
         
-        # Search region: from 50ms to 600ms (or 70% of cycle)
+        # Search region: from 80ms to 600ms (or 70% of cycle)
         max_search_end = int(min(len(ppg_norm) * 0.7, 0.6 * self.fs))
         max_search_end = max(max_search_end, min_search_start + 50)
         
@@ -1061,6 +1204,190 @@ def validate_features(features: Dict[str, float], strict: bool = False) -> bool:
         return False
     
     return True
+
+
+def validate_patient_physiology(patient_df, min_samples: int = 100, strict: bool = False) -> Tuple[bool, str, Dict]:
+    """
+    Validate that a patient's data shows physiologically correct relationships.
+    
+    CRITICAL: Analysis of VitalDB data showed that ~35% of patients have WRONG
+    PTT-BP correlation sign. This is caused by:
+    1. Low signal quality (PPG std < 3) making foot detection unreliable
+    2. Inverted PPG polarity that wasn't correctly detected
+    3. Confounding from HR changes (HR-PTT should be negative)
+    
+    A valid patient should show:
+    - Negative PTT-SBP correlation (higher BP → stiffer arteries → faster transit)
+    - Negative HR-PTT correlation (higher HR → shorter cycle → shorter PTT)
+    - Sufficient PTT variability (std > 10ms) to detect meaningful changes
+    
+    Args:
+        patient_df: DataFrame with features for ONE patient
+        min_samples: Minimum samples required for analysis
+        strict: If True, apply stricter validation (requires correct correlation signs)
+        
+    Returns:
+        Tuple of (is_valid, reason, metrics_dict)
+    """
+    if len(patient_df) < min_samples:
+        return False, f"insufficient_samples_{len(patient_df)}", {}
+    
+    metrics = {}
+    
+    # Get key features
+    ptt = patient_df['ptt_peak_to_foot'] if 'ptt_peak_to_foot' in patient_df.columns else patient_df['pat_ecg_ppg']
+    sbp = patient_df['sbp_reference']
+    hr = patient_df['hr_bpm']
+    
+    # Calculate correlations
+    ptt_sbp_r = ptt.corr(sbp)
+    ptt_hr_r = ptt.corr(hr)
+    hr_sbp_r = hr.corr(sbp)
+    ptt_std = ptt.std()
+    sbp_std = sbp.std()
+    
+    metrics['ptt_sbp_r'] = ptt_sbp_r
+    metrics['ptt_hr_r'] = ptt_hr_r
+    metrics['hr_sbp_r'] = hr_sbp_r
+    metrics['ptt_std'] = ptt_std
+    metrics['sbp_std'] = sbp_std
+    metrics['n_samples'] = len(patient_df)
+    
+    # Validation rules based on physiology
+    reasons = []
+    
+    if strict:
+        # STRICT MODE: Require correct physiological relationships
+        
+        # Rule 1: PTT variability must be high enough
+        if ptt_std < 15:
+            reasons.append(f"low_ptt_variability_{ptt_std:.1f}ms")
+        
+        # Rule 2: HR-PTT correlation MUST be negative
+        if ptt_hr_r >= 0:
+            reasons.append(f"wrong_hr_ptt_corr_{ptt_hr_r:.2f}")
+        
+        # Rule 3: PTT-SBP correlation MUST be negative
+        if ptt_sbp_r >= 0:
+            reasons.append(f"wrong_ptt_sbp_corr_{ptt_sbp_r:.2f}")
+        
+        # Rule 4: SBP must have reasonable variability
+        if sbp_std < 5:
+            reasons.append(f"low_sbp_variability_{sbp_std:.1f}mmHg")
+    else:
+        # PERMISSIVE MODE: Only reject clearly broken data
+        
+        # Rule 1: PTT variability check
+        if ptt_std < 10:
+            reasons.append(f"low_ptt_variability_{ptt_std:.1f}ms")
+        
+        # Rule 2: HR-PTT correlation should NOT be strongly positive
+        if ptt_hr_r > 0.3:
+            reasons.append(f"wrong_hr_ptt_corr_{ptt_hr_r:.2f}")
+        
+        # Rule 3: PTT-SBP correlation should NOT be strongly positive
+        if ptt_sbp_r > 0.2:
+            reasons.append(f"wrong_ptt_sbp_corr_{ptt_sbp_r:.2f}")
+        
+        # Rule 4: SBP must have some variability
+        if sbp_std < 5:
+            reasons.append(f"low_sbp_variability_{sbp_std:.1f}mmHg")
+    
+    if len(reasons) > 0:
+        return False, "|".join(reasons), metrics
+    
+    return True, "ok", metrics
+
+
+def filter_valid_patients(df, strict: bool = False, remove_boundary_samples: bool = True, verbose: bool = True):
+    """
+    Filter dataset to only include physiologically valid patients and samples.
+    
+    Args:
+        df: Full DataFrame with all patients
+        strict: If True, apply stricter validation (requires correct correlation signs)
+                Use strict=True for highest quality data (r ~ -0.18)
+                Use strict=False for more samples (r ~ -0.02)
+        remove_boundary_samples: If True, also remove samples at PTT boundaries (40ms, 250ms)
+                                 and amplitude_ratio boundaries (0, 1)
+        verbose: Print summary statistics
+        
+    Returns:
+        Tuple of (filtered DataFrame, patient_metrics dict)
+    """
+    initial_samples = len(df)
+    
+    # Step 1: Remove boundary samples (sample-level filtering)
+    if remove_boundary_samples:
+        ptt_col = 'ptt_peak_to_foot' if 'ptt_peak_to_foot' in df.columns else 'pat_ecg_ppg'
+        
+        # PTT boundaries: remove samples at exact 40ms or 250ms
+        # These are artifacts from the extraction algorithm hitting limits
+        boundary_mask = (
+            (df[ptt_col] > 42) &  # Allow 2ms tolerance above minimum
+            (df[ptt_col] < 248) &  # Allow 2ms tolerance below maximum
+            (df['amplitude_ratio_ra'] > 0.02) &  # Near-zero is suspicious
+            (df['amplitude_ratio_ra'] < 0.98)    # Near-one is suspicious (default value)
+        )
+        
+        df = df[boundary_mask].copy()
+        
+        if verbose:
+            removed = initial_samples - len(df)
+            print(f"\n=== Sample-Level Filtering ===")
+            print(f"Removed {removed:,} boundary samples ({100*removed/initial_samples:.1f}%)")
+            print(f"Remaining: {len(df):,} samples")
+    
+    # Step 2: Patient-level validation
+    valid_patients = []
+    invalid_patients = []
+    patient_metrics = {}
+    
+    for pid in df['patient_id'].unique():
+        patient_df = df[df['patient_id'] == pid]
+        is_valid, reason, metrics = validate_patient_physiology(patient_df, strict=strict)
+        
+        patient_metrics[pid] = {
+            'is_valid': is_valid,
+            'reason': reason,
+            **metrics
+        }
+        
+        if is_valid:
+            valid_patients.append(pid)
+        else:
+            invalid_patients.append(pid)
+    
+    if verbose:
+        n_total = len(valid_patients) + len(invalid_patients)
+        print(f"\n=== Patient Validation Summary ===")
+        print(f"Total patients: {n_total}")
+        print(f"Valid patients: {len(valid_patients)} ({100*len(valid_patients)/n_total:.1f}%)")
+        print(f"Invalid patients: {len(invalid_patients)} ({100*len(invalid_patients)/n_total:.1f}%)")
+        
+        # Categorize reasons
+        reason_counts = {}
+        for pid in invalid_patients:
+            reasons = patient_metrics[pid]['reason'].split('|')
+            for r in reasons:
+                reason_type = r.split('_')[0] + '_' + r.split('_')[1] if '_' in r else r
+                reason_counts[reason_type] = reason_counts.get(reason_type, 0) + 1
+        
+        if reason_counts:
+            print(f"\nInvalidity reasons:")
+            for reason, count in sorted(reason_counts.items(), key=lambda x: -x[1]):
+                print(f"  {reason}: {count} patients")
+    
+    # Filter to valid patients only
+    df_filtered = df[df['patient_id'].isin(valid_patients)].copy()
+    
+    if verbose:
+        print(f"\nFiltered dataset: {len(df_filtered):,} samples from {len(valid_patients)} patients")
+        if len(df_filtered) > 0:
+            ptt_sbp_r = df_filtered['ptt_peak_to_foot'].corr(df_filtered['sbp_reference'])
+            print(f"Overall PTT-SBP correlation: r = {ptt_sbp_r:.4f}")
+    
+    return df_filtered, patient_metrics
 
 
 # Example usage

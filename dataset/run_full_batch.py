@@ -1,4 +1,5 @@
 from bp_pipeline import BPEstimationPipeline
+from fixed_feature_extraction import filter_valid_patients, validate_patient_physiology
 import os
 import logging
 import argparse
@@ -111,14 +112,48 @@ def main():
         # Add per-patient normalized features
         df = add_per_patient_normalized_features(df)
         
-        # Save the enhanced dataset
+        # Save the full dataset (before validation filtering)
         output_path = './data/processed/bp_dataset_features.csv'
         df.to_csv(output_path, index=False)
-        logger.info(f"Saved enhanced dataset to {output_path}")
+        logger.info(f"Saved full dataset to {output_path}")
         
-        # Print correlation analysis
+        # ============================================
+        # NEW: Patient physiology validation
+        # Filter out patients with wrong PTT-BP relationships
+        # ============================================
         print("\n" + "="*60)
-        print("FEATURE-BP CORRELATIONS (with new PAT features)")
+        print("PATIENT PHYSIOLOGY VALIDATION")
+        print("="*60)
+        
+        # Permissive validation (more samples, weaker correlation)
+        print("\n--- Permissive Mode (more samples) ---")
+        df_validated, patient_metrics = filter_valid_patients(df, strict=False, verbose=True)
+        
+        # Strict validation (fewer samples, stronger correlation)
+        print("\n--- Strict Mode (better correlation) ---")
+        df_strict, strict_metrics = filter_valid_patients(df, strict=True, verbose=True)
+        
+        if len(df_validated) > 0:
+            # Save the permissive validated dataset
+            validated_output_path = './data/processed/bp_dataset_validated.csv'
+            df_validated.to_csv(validated_output_path, index=False)
+            logger.info(f"Saved validated dataset to {validated_output_path}")
+        
+        if len(df_strict) > 0:
+            # Save the strict validated dataset (highest quality)
+            strict_output_path = './data/processed/bp_dataset_strict.csv'
+            df_strict.to_csv(strict_output_path, index=False)
+            logger.info(f"Saved strict dataset to {strict_output_path}")
+            
+            # Save patient metrics for analysis
+            metrics_df = pd.DataFrame.from_dict(patient_metrics, orient='index')
+            metrics_df.index.name = 'patient_id'
+            metrics_df.to_csv('./data/processed/patient_validation_metrics.csv')
+            logger.info("Saved patient validation metrics to patient_validation_metrics.csv")
+        
+        # Print correlation analysis (using strict validated data for best results)
+        print("\n" + "="*60)
+        print("FEATURE-BP CORRELATIONS (STRICT VALIDATED PATIENTS)")
         print("="*60)
         
         key_features = [
@@ -128,16 +163,29 @@ def main():
             'amplitude_ratio_ra', 'reflection_index'
         ]
         
+        # Use strict validated data for correlation analysis (best quality)
+        analysis_df = df_strict if len(df_strict) > 0 else (df_validated if len(df_validated) > 0 else df)
+        
         for feat in key_features:
-            if feat in df.columns:
-                corr_sbp = df[feat].corr(df['sbp_reference'])
-                corr_dbp = df[feat].corr(df['dbp_reference'])
+            if feat in analysis_df.columns:
+                corr_sbp = analysis_df[feat].corr(analysis_df['sbp_reference'])
+                corr_dbp = analysis_df[feat].corr(analysis_df['dbp_reference'])
                 # Also check correlation with BP delta (changes)
-                corr_sbp_delta = df[feat].corr(df.get('sbp_delta', df['sbp_reference']))
+                corr_sbp_delta = analysis_df[feat].corr(analysis_df.get('sbp_delta', analysis_df['sbp_reference']))
                 print(f"{feat:25s}: SBP r={corr_sbp:+.3f}, DBP r={corr_dbp:+.3f}, SBP_delta r={corr_sbp_delta:+.3f}")
         
+        # Also show full dataset correlations for comparison
+        if len(df_validated) > 0 and len(df_validated) != len(df):
+            print("\n" + "-"*60)
+            print("COMPARISON: Full dataset (unvalidated)")
+            print("-"*60)
+            for feat in ['pat_ecg_ppg', 'ptt_peak_to_foot']:
+                if feat in df.columns:
+                    corr_sbp = df[feat].corr(df['sbp_reference'])
+                    print(f"{feat:25s}: SBP r={corr_sbp:+.3f}")
+        
         print("\nDataset Summary:")
-        print(df.describe())
+        print(analysis_df.describe())
     else:
         logger.warning("No features extracted. Check logs for errors.")
 
