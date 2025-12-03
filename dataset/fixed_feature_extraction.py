@@ -895,6 +895,10 @@ def validate_features(features: Dict[str, float], strict: bool = False) -> bool:
         
     Returns:
         True if all features are valid
+        
+    Key validation: PTT must be physiologically valid relative to HR.
+    High PTT (>150ms) with normal HR indicates bad foot detection.
+    Constraint: PTT < 20% of cardiac cycle length.
     """
     if not features:
         return False
@@ -915,6 +919,12 @@ def validate_features(features: Dict[str, float], strict: bool = False) -> bool:
                 log_extraction_failure('nan_features')
                 return False
     
+    # Get core values for validation
+    hr = features.get('hr_bpm', 0)
+    ptt = features.get('ptt_peak_to_foot', 0)
+    pat = features.get('pat_ecg_ppg', 0)
+    amp = features.get('amplitude_ratio_ra', 0)
+    
     # Physiological validation thresholds
     if strict:
         # Strict thresholds - clinically validated ranges
@@ -922,35 +932,44 @@ def validate_features(features: Dict[str, float], strict: bool = False) -> bool:
         ptt_range = (50, 400)  # ms - within PPG cycle
         hr_range = (30, 200)   # BPM
         amp_range = (0.05, 0.95)  # amplitude ratio
+        ptt_max_cycle_pct = 0.15  # PTT < 15% of cardiac cycle (strict)
     else:
         # Permissive thresholds - only reject clearly broken data
         pat_range = (1, 1000)
-        ptt_range = (1, 2000)
+        ptt_range = (1, 500)  # Tightened from 2000 to 500ms absolute max
         hr_range = (10, 300)
         amp_range = (0.001, 1.5)  # Allow slight overshoot
+        ptt_max_cycle_pct = 0.20  # PTT < 20% of cardiac cycle (permissive)
+    
+    # HR validation (first, needed for PTT/cycle validation)
+    if not (hr_range[0] <= hr <= hr_range[1]):
+        logger.debug(f"HR out of range: {hr} (allowed: {hr_range})")
+        return False
     
     # PAT validation
-    pat = features.get('pat_ecg_ppg', 0)
     if not (pat_range[0] <= pat <= pat_range[1]):
         logger.debug(f"PAT out of range: {pat} (allowed: {pat_range})")
         log_extraction_failure('invalid_ptt')
         return False
     
-    # PTT validation
-    ptt = features.get('ptt_peak_to_foot', 0)
+    # PTT absolute range validation
     if not (ptt_range[0] <= ptt <= ptt_range[1]):
         logger.debug(f"PTT out of range: {ptt} (allowed: {ptt_range})")
         log_extraction_failure('invalid_ptt')
         return False
     
-    # HR validation
-    hr = features.get('hr_bpm', 0)
-    if not (hr_range[0] <= hr <= hr_range[1]):
-        logger.debug(f"HR out of range: {hr} (allowed: {hr_range})")
-        return False
+    # NEW: PTT relative to cardiac cycle validation
+    # PTT should be < 20% of cardiac cycle (physiological constraint)
+    # High PTT with normal HR indicates bad foot detection (dicrotic notch or next cycle)
+    if hr > 0:
+        cycle_length_ms = 60000.0 / hr  # Cardiac cycle in ms
+        max_ptt_for_hr = ptt_max_cycle_pct * cycle_length_ms
+        if ptt > max_ptt_for_hr:
+            logger.debug(f"PTT too high relative to HR: {ptt:.1f}ms > {max_ptt_for_hr:.1f}ms ({ptt_max_cycle_pct*100:.0f}% of {cycle_length_ms:.0f}ms cycle)")
+            log_extraction_failure('invalid_ptt')
+            return False
     
     # Amplitude ratio validation
-    amp = features.get('amplitude_ratio_ra', 0)
     if not (amp_range[0] <= amp <= amp_range[1]):
         logger.debug(f"Amplitude ratio out of range: {amp} (allowed: {amp_range})")
         return False
@@ -958,6 +977,13 @@ def validate_features(features: Dict[str, float], strict: bool = False) -> bool:
     # Additional: amplitude ratio = exactly 1.0 is suspicious (default value)
     if strict and amp == 1.0:
         logger.debug("Amplitude ratio exactly 1.0 (suspicious default)")
+        return False
+    
+    # NEW: Low amplitude ratio + high PTT is especially suspicious
+    # This indicates foot detection found a later point in the waveform
+    if amp < 0.15 and ptt > 120:
+        logger.debug(f"Suspicious: low Ra ({amp:.2f}) + high PTT ({ptt:.0f}ms) - likely bad foot detection")
+        log_extraction_failure('invalid_ptt')
         return False
     
     return True
