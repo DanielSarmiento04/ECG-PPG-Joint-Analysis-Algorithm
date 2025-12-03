@@ -259,13 +259,22 @@ class FixedFeatureExtractor:
         
         if len(ppg_segment) < 50:  # Need at least 100ms of signal
             return 0, 0.0
+        
+        # Detect PPG polarity: In some systems, PPG is inverted
+        mid_point = len(ppg_segment) // 2
+        first_quarter = np.mean(ppg_segment[:len(ppg_segment)//4])
+        second_quarter = np.mean(ppg_segment[len(ppg_segment)//4:mid_point])
+        is_inverted = first_quarter > second_quarter
+        
+        # Work with signal in "normal" orientation
+        ppg_work = -ppg_segment if is_inverted else ppg_segment
             
         # Normalize the segment
-        ppg_min = np.min(ppg_segment)
-        ppg_max = np.max(ppg_segment)
+        ppg_min = np.min(ppg_work)
+        ppg_max = np.max(ppg_work)
         if ppg_max - ppg_min < 1e-6:
             return 0, 0.0
-        ppg_norm = (ppg_segment - ppg_min) / (ppg_max - ppg_min)
+        ppg_norm = (ppg_work - ppg_min) / (ppg_max - ppg_min)
         
         search_region = ppg_norm[:max_search_samples]
         
@@ -395,53 +404,63 @@ class FixedFeatureExtractor:
         Returns:
             Tuple of (peak_index, peak_value)
         """
-        # Normalize if not already
-        ppg_min = np.min(ppg_segment)
-        ppg_max = np.max(ppg_segment)
+        # Detect PPG polarity: In some systems, PPG is inverted
+        # (minimum = systolic peak due to maximum blood volume absorption)
+        # Check if the signal decreases in the first half (inverted) or increases (normal)
+        mid_point = len(ppg_segment) // 2
+        first_quarter = np.mean(ppg_segment[:len(ppg_segment)//4])
+        second_quarter = np.mean(ppg_segment[len(ppg_segment)//4:mid_point])
+        
+        # If signal decreases from start to middle, it's likely inverted
+        is_inverted = first_quarter > second_quarter
+        
+        # Work with the signal in "normal" orientation (peak = maximum)
+        if is_inverted:
+            ppg_work = -ppg_segment  # Invert to find minimum as "peak"
+        else:
+            ppg_work = ppg_segment
+        
+        # Normalize
+        ppg_min = np.min(ppg_work)
+        ppg_max = np.max(ppg_work)
         if ppg_max - ppg_min > 1e-6:
-            ppg_norm = (ppg_segment - ppg_min) / (ppg_max - ppg_min)
+            ppg_norm = (ppg_work - ppg_min) / (ppg_max - ppg_min)
         else:
             return len(ppg_segment) // 3, 0.5  # Safe default
         
         # Skip the initial ECG artifact region (first 50ms at 500Hz = 25 samples)
         # The PPG systolic peak physiologically occurs at ~100-400ms after R-peak
-        # due to pulse transit time from heart to finger
-        min_peak_delay_ms = 50  # Reduced to allow faster transit times
+        min_peak_delay_ms = 50
         min_search_start = int(min_peak_delay_ms / 1000 * self.fs)
         
-        # Also ensure we have enough signal after the minimum delay
         if len(ppg_norm) < min_search_start + 20:
-            # Very short cycle - use global argmax as fallback
             peak_idx = int(np.argmax(ppg_norm))
-            return peak_idx, float(ppg_norm[peak_idx])
+            return peak_idx, float(ppg_segment[peak_idx])
         
         # Search region: from 50ms to 600ms (or 70% of cycle)
-        # This avoids ECG artifacts at the very start and baseline drift at the end
         max_search_end = int(min(len(ppg_norm) * 0.7, 0.6 * self.fs))
-        max_search_end = max(max_search_end, min_search_start + 50)  # At least 50 samples to search
+        max_search_end = max(max_search_end, min_search_start + 50)
         
         search_region = ppg_norm[min_search_start:max_search_end]
         
         if len(search_region) < 10:
-            # Fallback for very short segments
             peak_idx = int(np.argmax(ppg_norm))
-            return peak_idx, float(ppg_norm[peak_idx])
+            return peak_idx, float(ppg_segment[peak_idx])
         
-        # Find peaks in the constrained region with reduced prominence requirement
+        # Find peaks with reduced prominence requirement
         peaks, properties = sig.find_peaks(search_region, prominence=min_prominence * 0.5)
         
         if len(peaks) == 0:
-            # Fallback: use argmax in the constrained region
             local_peak_idx = int(np.argmax(search_region))
-            peak_idx = min_search_start + local_peak_idx  # Convert back to full signal index
-            return peak_idx, float(ppg_norm[peak_idx])
+            peak_idx = min_search_start + local_peak_idx
+            return peak_idx, float(ppg_segment[peak_idx])
         
-        # Take the most prominent peak (usually systolic)
+        # Take the most prominent peak
         most_prominent_idx = np.argmax(properties['prominences'])
         local_peak_idx = int(peaks[most_prominent_idx])
-        peak_idx = min_search_start + local_peak_idx  # Convert back to full signal index
+        peak_idx = min_search_start + local_peak_idx
         
-        return peak_idx, float(ppg_norm[peak_idx])
+        return peak_idx, float(ppg_segment[peak_idx])
     
     def find_dicrotic_notch(self, ppg_segment: np.ndarray,
                            systolic_peak_idx: int) -> Optional[int]:
