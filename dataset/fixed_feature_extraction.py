@@ -312,6 +312,7 @@ class FixedFeatureExtractor:
             return foot_idx, float(foot_idx / self.fs * 1000)
         
         # === Method 1: Second derivative maximum (in search region) ===
+        # This detects the point of maximum acceleration (start of upstroke)
         d1 = np.diff(smoothed)
         d2 = np.diff(d1)
         
@@ -319,14 +320,13 @@ class FixedFeatureExtractor:
         d2_start = max(0, foot_search_start - 1)
         d2_end = min(len(d2), foot_search_end - 1)
         
+        foot_d2 = 0
         if d2_end > d2_start:
             d2_search = d2[d2_start:d2_end]
             if len(d2_search) > 0:
-                foot_d2 = foot_search_start + int(np.argmax(d2_search))
-            else:
-                foot_d2 = 0
-        else:
-            foot_d2 = 0
+                # Find the maximum second derivative (acceleration peak)
+                max_d2_idx = int(np.argmax(d2_search))
+                foot_d2 = foot_search_start + max_d2_idx
             
         # === Method 2: Intersecting tangent ===
         d_search = d1[foot_search_start:foot_search_end] if foot_search_end < len(d1) else d1[foot_search_start:]
@@ -359,6 +359,16 @@ class FixedFeatureExtractor:
         # === Method 4: Minimum in search region ===
         foot_min = foot_search_start + int(np.argmin(foot_search_region))
         
+        # === Method 5: Percentage of rise (find where signal reaches 5% of rise to peak) ===
+        min_val_in_region = np.min(foot_search_region)
+        max_val_in_region = np.max(foot_search_region)
+        rise_threshold = min_val_in_region + 0.05 * (max_val_in_region - min_val_in_region)
+        above_rise = np.where(foot_search_region > rise_threshold)[0]
+        if len(above_rise) > 0:
+            foot_rise = foot_search_start + int(above_rise[0])
+        else:
+            foot_rise = 0
+        
         # === Consensus: Use median of valid estimates ===
         candidates = []
         
@@ -366,7 +376,7 @@ class FixedFeatureExtractor:
         min_foot_samples = int(0.025 * self.fs)  # 25ms
         max_foot_samples = int(0.200 * self.fs)  # 200ms
         
-        for foot_est in [foot_d2, foot_tangent, foot_threshold, foot_min]:
+        for foot_est in [foot_d2, foot_tangent, foot_threshold, foot_min, foot_rise]:
             # Must be in physiological range and before peak
             if min_foot_samples <= foot_est <= min(max_foot_samples, peak_idx - 1):
                 candidates.append(foot_est)
@@ -383,6 +393,12 @@ class FixedFeatureExtractor:
         else:
             # Use median of candidates
             foot_idx = int(np.median(candidates))
+        
+        # BOUNDARY CHECK: If foot_idx is at the minimum allowed boundary,
+        # and the signal has meaningful slope, use the 5% rise method
+        boundary_threshold = min_foot_samples + 3  # 28ms
+        if foot_idx <= boundary_threshold and foot_rise > boundary_threshold:
+            foot_idx = foot_rise
         
         foot_time_ms = float(foot_idx / self.fs * 1000)
         
@@ -435,7 +451,8 @@ class FixedFeatureExtractor:
         
         if len(ppg_norm) < min_search_start + 20:
             peak_idx = int(np.argmax(ppg_norm))
-            return peak_idx, float(ppg_segment[peak_idx])
+            # Return value from normalized signal, not original (handles inverted signals)
+            return peak_idx, float(ppg_norm[peak_idx])
         
         # Search region: from 50ms to 600ms (or 70% of cycle)
         max_search_end = int(min(len(ppg_norm) * 0.7, 0.6 * self.fs))
@@ -445,7 +462,7 @@ class FixedFeatureExtractor:
         
         if len(search_region) < 10:
             peak_idx = int(np.argmax(ppg_norm))
-            return peak_idx, float(ppg_segment[peak_idx])
+            return peak_idx, float(ppg_norm[peak_idx])
         
         # Find peaks with reduced prominence requirement
         peaks, properties = sig.find_peaks(search_region, prominence=min_prominence * 0.5)
@@ -453,66 +470,97 @@ class FixedFeatureExtractor:
         if len(peaks) == 0:
             local_peak_idx = int(np.argmax(search_region))
             peak_idx = min_search_start + local_peak_idx
-            return peak_idx, float(ppg_segment[peak_idx])
+            return peak_idx, float(ppg_norm[peak_idx])
         
         # Take the most prominent peak
         most_prominent_idx = np.argmax(properties['prominences'])
         local_peak_idx = int(peaks[most_prominent_idx])
         peak_idx = min_search_start + local_peak_idx
         
-        return peak_idx, float(ppg_segment[peak_idx])
+        # Return value from normalized signal (handles inverted signals correctly)
+        return peak_idx, float(ppg_norm[peak_idx])
     
     def find_dicrotic_notch(self, ppg_segment: np.ndarray,
                            systolic_peak_idx: int) -> Optional[int]:
         """
-        Find dicrotic notch using second derivative zero-crossing.
+        Find dicrotic notch using multiple methods.
         
         The dicrotic notch is the inflection point between the systolic
         peak and diastolic peak, representing aortic valve closure.
         
         Args:
-            ppg_segment: PPG waveform
+            ppg_segment: PPG waveform (normalized 0-1)
             systolic_peak_idx: Index of systolic peak
             
         Returns:
             Index of dicrotic notch, or None if not found
         """
-        # Search region: from systolic peak to ~300ms after
-        max_notch_delay_samples = int(0.3 * self.fs)
+        # Search region: from systolic peak to ~350ms after (or 80% of remaining cycle)
+        remaining_samples = len(ppg_segment) - systolic_peak_idx
+        max_notch_delay_samples = min(int(0.35 * self.fs), int(remaining_samples * 0.8))
         search_end = min(systolic_peak_idx + max_notch_delay_samples, len(ppg_segment) - 2)
         
-        if search_end <= systolic_peak_idx + 5:
+        if search_end <= systolic_peak_idx + 10:
             return None
         
         # Get the post-peak segment
         post_peak = ppg_segment[systolic_peak_idx:search_end]
         
-        if len(post_peak) < 10:
+        if len(post_peak) < 15:
             return None
         
         # Smooth to reduce noise
         smoothed = gaussian_filter1d(post_peak, sigma=2)
         
-        # Method 1: Second derivative zero-crossing (inflection point)
+        # === Method 1: Second derivative zero-crossing (inflection point) ===
         d1 = np.diff(smoothed)
         d2 = np.diff(d1)
         
-        # Find sign changes in second derivative
-        sign_changes = np.where(np.diff(np.sign(d2)))[0]
+        notch_candidates = []
         
+        # Find sign changes in second derivative (concave to convex transition)
+        sign_changes = np.where(np.diff(np.sign(d2)))[0]
         if len(sign_changes) > 0:
             # First inflection point after peak is usually the notch
-            notch_idx_rel = sign_changes[0] + 1
-            notch_idx = systolic_peak_idx + notch_idx_rel
-            return notch_idx
+            notch_d2 = systolic_peak_idx + sign_changes[0] + 1
+            notch_candidates.append(notch_d2)
         
-        # Method 2 fallback: Local minimum
-        valleys, _ = sig.find_peaks(-smoothed)
+        # === Method 2: Local minimum (valley) ===
+        valleys, properties = sig.find_peaks(-smoothed, prominence=0.01)
         if len(valleys) > 0:
-            notch_idx = systolic_peak_idx + valleys[0]
-            return notch_idx
+            # Take the first valley (closest to systolic peak)
+            notch_valley = systolic_peak_idx + valleys[0]
+            notch_candidates.append(notch_valley)
         
-        return None
+        # === Method 3: Maximum negative slope (steepest descent after peak) ===
+        if len(d1) > 5:
+            # Find where slope is most negative (steepest descent)
+            min_slope_idx = np.argmin(d1)
+            # Notch is typically shortly after the steepest descent
+            notch_slope = systolic_peak_idx + min(min_slope_idx + 5, len(d1) - 1)
+            # Only use if it's in a reasonable range (20-150ms after peak)
+            if 10 < (notch_slope - systolic_peak_idx) < int(0.15 * self.fs):
+                notch_candidates.append(notch_slope)
+        
+        # === Method 4: Percentage drop from peak ===
+        # Notch typically occurs when signal drops to 70-90% of peak amplitude
+        peak_val = smoothed[0]  # Since post_peak starts at systolic peak
+        end_val = smoothed[-1]
+        target_drop = peak_val - 0.25 * (peak_val - end_val)  # 25% drop
+        
+        below_target = np.where(smoothed < target_drop)[0]
+        if len(below_target) > 0 and below_target[0] > 3:
+            notch_drop = systolic_peak_idx + below_target[0]
+            notch_candidates.append(notch_drop)
+        
+        # === Consensus: use median of valid candidates ===
+        if len(notch_candidates) == 0:
+            return None
+        elif len(notch_candidates) == 1:
+            return notch_candidates[0]
+        else:
+            # Use median for robustness
+            return int(np.median(notch_candidates))
     
     def find_max_slope(self, ppg_segment: np.ndarray,
                       start_idx: int = 0,
@@ -662,15 +710,22 @@ class FixedFeatureExtractor:
         # Find dicrotic notch
         notch_idx = self.find_dicrotic_notch(ppg_norm, peak_idx)
         
+        # Use values directly from ppg_norm for consistent calculation
+        # (peak_val from find_systolic_peak may use different normalization)
+        actual_peak_val = ppg_norm[peak_idx]
+        actual_foot_val = ppg_norm[foot_idx] if 0 <= foot_idx < len(ppg_norm) else ppg_norm[0]
+        
         if notch_idx is not None and 0 < notch_idx < len(ppg_norm):
             notch_val = ppg_norm[notch_idx]
-            foot_val = ppg_norm[foot_idx]
             
             # Amplitude ratio (Ra) - FIXED calculation
             # Ra = (peak - notch) / (peak - foot)
-            denominator = peak_val - foot_val
+            # Handle both normal and inverted signals
+            denominator = abs(actual_peak_val - actual_foot_val)
             if denominator > 0.01:  # Avoid division by very small numbers
-                ra = (peak_val - notch_val) / denominator
+                # For normal signals: peak > foot, notch between them
+                # For inverted signals: after our foot/peak detection, peak_val should be higher
+                ra = abs(actual_peak_val - notch_val) / denominator
                 ra = np.clip(ra, 0, 1)  # Ra should be in [0, 1]
             else:
                 ra = 0.5  # Default if waveform is too flat
@@ -686,10 +741,47 @@ class FixedFeatureExtractor:
             features['diastolic_duration_tfd'] = max(0, tfd_ms)
             
         else:
-            # Fallback: estimate using peak position
-            # Typical systolic phase is ~30-40% of cycle
+            # Fallback: estimate amplitude ratio from waveform shape
+            # Even without clear notch, we can estimate Ra from the decay pattern
             cycle_duration_ms = len(ppg_norm) / self.fs * 1000
-            features['amplitude_ratio_ra'] = 0.5  # Neutral default
+            
+            # The notch typically occurs 50-150ms AFTER the systolic peak
+            # Estimate notch position relative to peak, not absolute cycle position
+            notch_delay_samples = int(0.08 * self.fs)  # ~80ms after peak
+            estimated_notch_pos = peak_idx + notch_delay_samples
+            
+            if 0 < peak_idx < estimated_notch_pos < len(ppg_norm) - 5:
+                # Estimate Ra from signal at estimated notch position
+                estimated_notch_val = ppg_norm[estimated_notch_pos]
+                foot_val = ppg_norm[foot_idx] if 0 <= foot_idx < len(ppg_norm) else ppg_norm[0]
+                
+                denominator = peak_val - foot_val
+                if denominator > 0.01:
+                    ra = (peak_val - estimated_notch_val) / denominator
+                    ra = np.clip(ra, 0.1, 0.9)  # Constrain to reasonable range
+                else:
+                    ra = 0.5
+            else:
+                # Alternative: use the minimum in the post-peak region (30-60% of remaining cycle)
+                remaining_start = peak_idx + int(0.02 * self.fs)  # 20ms after peak
+                remaining_end = min(peak_idx + int(0.2 * self.fs), len(ppg_norm) - 1)  # up to 200ms after
+                
+                if remaining_end > remaining_start + 5:
+                    post_peak_region = ppg_norm[remaining_start:remaining_end]
+                    local_min_idx = remaining_start + int(np.argmin(post_peak_region))
+                    estimated_notch_val = ppg_norm[local_min_idx]
+                    foot_val = ppg_norm[foot_idx] if 0 <= foot_idx < len(ppg_norm) else ppg_norm[0]
+                    
+                    denominator = peak_val - foot_val
+                    if denominator > 0.01:
+                        ra = (peak_val - estimated_notch_val) / denominator
+                        ra = np.clip(ra, 0.1, 0.9)
+                    else:
+                        ra = 0.5
+                else:
+                    ra = 0.5
+            
+            features['amplitude_ratio_ra'] = ra
             features['systolic_duration_tsd'] = cycle_duration_ms * 0.35
             features['diastolic_duration_tfd'] = cycle_duration_ms * 0.65
         
