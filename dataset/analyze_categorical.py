@@ -85,7 +85,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train Temporal Transformer for BP Estimation')
     
     # Data parameters
-    parser.add_argument('--data_path', type=str, default='src/data/bp_dataset_features.csv',
+    parser.add_argument('--data_path', type=str, default='./data/bp_dataset_features.csv',
                        help='Path to the dataset file (CSV or Excel)')
     
     parser.add_argument('--output_dir', type=str, default='./data/figures',
