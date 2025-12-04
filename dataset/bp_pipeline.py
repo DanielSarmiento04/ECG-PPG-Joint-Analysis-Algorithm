@@ -11,7 +11,7 @@ import joblib
 from dataclasses import dataclass
 
 # Import fixed feature extraction (addresses bugs identified in forensic analysis)
-from fixed_feature_extraction import FixedFeatureExtractor, validate_features
+from fixed_feature_extraction import FixedFeatureExtractor, validate_features, detect_global_ppg_polarity
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -494,6 +494,11 @@ class BPEstimationPipeline:
         
         # Stage 4: Segmentation & Sync
         cycles = self.segment_and_sync_cycles(ecg_filtered, ppg_filtered, r_peaks, sbp_ref, dbp_ref)
+        
+        # Stage 4.5: Set global PPG polarity for consistent detection
+        # This MUST be called before extract_features_batch to ensure
+        # all beats use the same polarity (avoids per-beat polarity flip issues)
+        self.feature_extractor.set_global_polarity(ppg_filtered, r_peaks)
         
         # Stage 5: Feature Extraction
         df_features = self.extract_features_batch(cycles)

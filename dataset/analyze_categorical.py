@@ -88,7 +88,7 @@ if __name__ == "__main__":
     parser.add_argument('--data_path', type=str, default='./data/bp_dataset_features.csv',
                        help='Path to the dataset file (CSV or Excel)')
     
-    parser.add_argument('--output_dir', type=str, default='./data/figures',
+    parser.add_argument('--output_dir', type=str, default='./data/processed/figures',
                           help='Directory to save output figures')
     
     analyze_categorical(

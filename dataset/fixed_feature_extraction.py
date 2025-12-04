@@ -557,20 +557,49 @@ class FixedFeatureExtractor:
         search_region = ppg_norm[:max_search_samples]
         smoothed = gaussian_filter1d(search_region, sigma=3)
 
-        # === IMPROVED PEAK DETECTION (v2.6) ===
+        # === IMPROVED PEAK DETECTION (v2.7) ===
         # CRITICAL: First check if this is a "peak-before-R-peak" beat
         # In some VitalDB recordings, the PPG systolic peak occurs BEFORE the R-peak
         # (due to sensor placement or synchronization issues)
         
-        # Check early portion of beat for monotonic decrease (indicates peak is behind us)
+        # Check early portion of beat using multiple criteria
         early_check_samples = int(0.080 * self.fs)  # Check first 80ms
-        if early_check_samples < len(smoothed):
-            early_segment = smoothed[:early_check_samples]
-            early_diffs = np.diff(early_segment)
+        
+        # Use the ORIGINAL normalized signal (before detrend) for shape check
+        orig_norm = (ppg_clean - np.min(ppg_clean)) / (np.max(ppg_clean) - np.min(ppg_clean) + 1e-10)
+        orig_smooth = gaussian_filter1d(orig_norm[:max_search_samples], sigma=3)
+        
+        is_inverted_timing = False
+        if early_check_samples < len(orig_smooth):
+            # Criterion 1: Value at 80ms significantly lower than at 0ms (>15% drop)
+            val_at_start = orig_smooth[0]
+            val_at_80ms = orig_smooth[early_check_samples - 1]
+            overall_decrease = val_at_start - val_at_80ms > 0.15
+            
+            # Criterion 2: Maximum in first 20ms (peak is at/before R-peak)
+            # This catches beats where the max is at index 0-10
+            first_20ms = int(0.020 * self.fs)  # ~10 samples
+            max_pos = np.argmax(orig_smooth[:int(0.150 * self.fs)])
+            max_very_early = max_pos < first_20ms
+            
+            # Criterion 3: Percentage of decreasing samples (relaxed threshold)
+            early_diffs = np.diff(orig_smooth[:early_check_samples])
             pct_decreasing = np.sum(early_diffs < 0) / len(early_diffs)
             
-            # If >80% of first 80ms is decreasing, the peak is likely BEFORE R-peak
-            if pct_decreasing > 0.80:
+            # Criterion 4: Start value is near maximum (>0.9 normalized)
+            starts_high = val_at_start > 0.90
+            
+            # Inverted timing if any of:
+            # - Overall decrease AND max is early
+            # - >70% decreasing in first 80ms
+            # - Max is at very start AND starts high (clear "started at peak" pattern)
+            is_inverted_timing = (
+                (overall_decrease and max_very_early) or 
+                pct_decreasing > 0.70 or
+                (max_very_early and starts_high)
+            )
+        
+        if is_inverted_timing:
                 # For these beats, find the minimum (diastolic point) across FULL beat
                 # The diastolic point is often beyond 400ms in these cases
                 
