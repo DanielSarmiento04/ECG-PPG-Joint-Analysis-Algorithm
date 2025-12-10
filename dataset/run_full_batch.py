@@ -22,8 +22,13 @@ def add_per_patient_normalized_features(df: pd.DataFrame) -> pd.DataFrame:
     This is critical for BP prediction because:
     - Absolute PTT varies ~100ms between individuals with same BP
     - Changes in PTT within a patient correlate better with BP changes
+    
+    NOTE: This function should be called AFTER any filtering operations to ensure
+    the normalization is computed on the final dataset. If filtering is done after
+    normalization, the per-patient mean/std will be biased.
     """
-    logger.info("Adding per-patient normalized features...")
+    n_patients = df['patient_id'].nunique()
+    logger.info(f"Computing per-patient normalized features for {n_patients} patients...")
     
     # Features to normalize per patient
     features_to_normalize = [
@@ -134,12 +139,20 @@ def main():
         df_strict, strict_metrics = filter_valid_patients(df, strict=True, verbose=True)
         
         if len(df_validated) > 0:
+            # RE-NORMALIZE after filtering to ensure mean~0, std~1 per patient
+            # The original normalization was based on full dataset, but filtering
+            # removes samples which can bias the per-patient statistics
+            df_validated = add_per_patient_normalized_features(df_validated)
+            
             # Save the permissive validated dataset
             validated_output_path = './data/processed/bp_dataset_validated.csv'
             df_validated.to_csv(validated_output_path, index=False)
             logger.info(f"Saved validated dataset to {validated_output_path}")
         
         if len(df_strict) > 0:
+            # RE-NORMALIZE after filtering to ensure mean~0, std~1 per patient
+            df_strict = add_per_patient_normalized_features(df_strict)
+            
             # Save the strict validated dataset (highest quality)
             strict_output_path = './data/processed/bp_dataset_strict.csv'
             df_strict.to_csv(strict_output_path, index=False)
